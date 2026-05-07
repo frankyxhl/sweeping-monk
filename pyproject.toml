@@ -3,7 +3,9 @@ name = "sweeping-monk"
 version = "0.1.0"
 description = "Local read-only PR review watchdog with Codex-bot integration."
 requires-python = ">=3.10"
-readme = "CLAUDE.md"
+readme = "README.md"
+license = {text = "MIT"}
+authors = [{name = "Frank Xu", email = "franky.xhl@gmail.com"}]
 dependencies = [
     "rich>=13.7",
     "typer>=0.12",
