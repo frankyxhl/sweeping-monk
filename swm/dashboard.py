@@ -37,8 +37,11 @@ CI_STYLE = {"SUCCESS": "green", "FAILURE": "red", "IN_PROGRESS": "yellow",
 CODEX_SIGNAL_DISPLAY = {
     "approved":  ("👍 approved",  "green"),
     "reviewing": ("👀 reviewing", "yellow"),
-    None:        ("💤 not engaged yet", "dim"),
 }
+# When Codex left no PR-body reaction, we differentiate two sub-cases by
+# whether it has posted any inline findings — see _codex_signal_text.
+CODEX_SIGNAL_NO_REACTION = ("💤 not engaged yet", "dim")
+CODEX_SIGNAL_FINDINGS_NO_REACTION = ("🤖 left findings (no body reaction)", "yellow")
 FIELD_LABEL = {
     "Status":    "🚦 Status",
     "Head":      "🔖 Head",
@@ -73,6 +76,15 @@ def _head_text(head_sha: str) -> Text:
     return Text(f"📌 {head_sha[:8]}", style="cyan")
 
 
+def _thread_location(thread) -> str:
+    """`<basename>:<line>` when we have a line; `<basename> (outdated)` otherwise.
+    GraphQL nulls `line` once the diff anchor is invalidated by a force-push."""
+    base = thread.path.split("/")[-1] if thread.path else "?"
+    if thread.line is None:
+        return f"{base} (outdated)"
+    return f"{base}:{thread.line}"
+
+
 def _status_text(status: Status) -> Text:
     style, icon = STATUS_STYLE.get(status, ("white", "?"))
     return Text(f"{icon} {status.value.upper()}", style=f"bold {style}")
@@ -94,8 +106,20 @@ def _ci_text(ci: dict) -> Text:
     return text
 
 
-def _codex_signal_text(signal: str | None) -> Text:
-    label, style = CODEX_SIGNAL_DISPLAY.get(signal, ("— unknown", "dim"))
+def _codex_signal_text(signal: str | None, *, has_findings: bool = False) -> Text:
+    """Render the Codex bot row.
+
+    When Codex has not added a body reaction (signal=None) we still distinguish
+    "Codex hasn't engaged at all" from "Codex left inline findings but no body
+    reaction" — the latter is common when at least one finding is unresolved
+    and Codex withholds 👍 until the author addresses it.
+    """
+    if signal in CODEX_SIGNAL_DISPLAY:
+        label, style = CODEX_SIGNAL_DISPLAY[signal]
+    elif signal is None:
+        label, style = CODEX_SIGNAL_FINDINGS_NO_REACTION if has_findings else CODEX_SIGNAL_NO_REACTION
+    else:
+        label, style = ("— unknown", "dim")
     return Text(label, style=style)
 
 
@@ -128,7 +152,9 @@ def _pr_card_with_snapshots(record: PollRecord, snapshots: dict[str, ThreadSnaps
     table.add_row(FIELD_LABEL["Head"],      _head_text(record.head_sha))
     table.add_row(FIELD_LABEL["CI"],        _ci_text(record.ci))
     table.add_row(FIELD_LABEL["Merge"],     _merge_text(record.merge_state))
-    table.add_row(FIELD_LABEL["Codex bot"], _codex_signal_text(record.codex_pr_body_signal))
+    table.add_row(FIELD_LABEL["Codex bot"], _codex_signal_text(
+        record.codex_pr_body_signal, has_findings=bool(record.threads),
+    ))
 
     table.add_section()  # horizontal divider before findings block
 
@@ -142,7 +168,7 @@ def _pr_card_with_snapshots(record: PollRecord, snapshots: dict[str, ThreadSnaps
             head_cell.append("  ")
             head_cell.append(f"{t.codex_severity.value}→{t.effective_severity.value}", style="bold")
             head_cell.append("  ")
-            head_cell.append(f"{t.path.split('/')[-1]}:{t.line}", style="cyan")
+            head_cell.append(_thread_location(t), style="cyan")
             table.add_row(f"  #{i}", head_cell)
             if t.title:
                 table.add_row("", Text(t.title))

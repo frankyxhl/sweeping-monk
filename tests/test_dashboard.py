@@ -131,3 +131,59 @@ def test_status_text_reflects_verdict_enum() -> None:
 
     # Assert
     assert "BLOCKED" in output
+
+
+def test_codex_bot_row_says_not_engaged_when_no_reaction_and_no_findings() -> None:
+    # Act
+    output = render_to_string(dashboard._codex_signal_text(None, has_findings=False))
+
+    # Assert
+    assert "not engaged" in output
+
+
+def test_codex_bot_row_says_left_findings_when_no_reaction_but_threads_present() -> None:
+    """Common case when Codex posts inline P2 findings but withholds the body 👍
+    until the author addresses them — 'not engaged yet' would be misleading."""
+    # Act
+    output = render_to_string(dashboard._codex_signal_text(None, has_findings=True))
+
+    # Assert
+    assert "left findings" in output
+    assert "not engaged" not in output
+
+
+def test_thread_location_renders_outdated_when_line_is_null() -> None:
+    """When GraphQL returns line=None (force-push invalidated the diff anchor)
+    we should NOT render 'codex.py:None'."""
+    from swm.dashboard import _thread_location
+
+    class _Stub:
+        path = "scripts/codex.py"
+        line = None
+
+    # Act
+    rendered = _thread_location(_Stub())
+
+    # Assert
+    assert rendered == "codex.py (outdated)"
+    assert "None" not in rendered
+
+
+def test_thread_location_renders_path_and_line_when_present() -> None:
+    from swm.dashboard import _thread_location
+
+    class _Stub:
+        path = ".github/workflows/test.yml"
+        line = 31
+
+    # Act / Assert
+    assert _thread_location(_Stub()) == "test.yml:31"
+
+
+def test_codex_bot_row_prefers_explicit_signal_over_findings_state() -> None:
+    # Arrange — has findings AND has a 👀 reaction → reaction wins
+    output = render_to_string(dashboard._codex_signal_text("reviewing", has_findings=True))
+
+    # Assert
+    assert "reviewing" in output
+    assert "left findings" not in output
