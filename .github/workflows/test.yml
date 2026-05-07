@@ -1,0 +1,38 @@
+name: tests
+
+on:
+  push:
+    branches: [main]
+    # Pure-docs pushes don't need to trigger the full matrix.
+    # Re-evaluate if rules/ ever gains executable content (af validate in CI etc.).
+    paths-ignore:
+      - 'rules/**'
+      - '*.md'
+  pull_request:
+    paths-ignore:
+      - 'rules/**'
+      - '*.md'
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+
+      - name: Install package + dev deps
+        run: pip install -e ".[dev]"
+
+      - name: Run pytest
+        run: pytest
