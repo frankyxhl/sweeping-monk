@@ -180,6 +180,16 @@ def test_thread_location_renders_path_and_line_when_present() -> None:
     assert _thread_location(_Stub()) == "test.yml:31"
 
 
+def test_pr_card_includes_clickable_github_url(ready_poll: PollRecord, thread_snapshot: ThreadSnapshot) -> None:
+    """Every report should embed the canonical PR URL so terminals can hyperlink it."""
+    # Act
+    output = render_to_string(dashboard.pr_card(ready_poll, thread_snapshot))
+
+    # Assert
+    expected_url = f"https://github.com/{ready_poll.repo}/pull/{ready_poll.pr}"
+    assert expected_url in output
+
+
 def test_codex_bot_row_prefers_explicit_signal_over_findings_state() -> None:
     # Arrange — has findings AND has a 👀 reaction → reaction wins
     output = render_to_string(dashboard._codex_signal_text("reviewing", has_findings=True))

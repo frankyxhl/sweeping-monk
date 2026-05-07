@@ -44,6 +44,7 @@ CODEX_SIGNAL_NO_REACTION = ("💤 not engaged yet", "dim")
 CODEX_SIGNAL_FINDINGS_NO_REACTION = ("🤖 left findings (no body reaction)", "yellow")
 FIELD_LABEL = {
     "Status":    "🚦 Status",
+    "Link":      "🔗 Link",
     "Head":      "🔖 Head",
     "CI":        "⚙️ CI",
     "Merge":     "🔀 Merge",
@@ -74,6 +75,14 @@ def _merge_text(merge_state: str | None) -> Text:
 
 def _head_text(head_sha: str) -> Text:
     return Text(f"📌 {head_sha[:8]}", style="cyan")
+
+
+def _pr_url_text(repo: str, pr: int) -> Text:
+    """A clickable PR URL. Rich emits OSC-8 hyperlink escapes via the `link`
+    style so iTerm2 / Kitty / WezTerm / VS Code terminal can cmd-click it;
+    in plain terminals it shows up as the underlined URL itself."""
+    url = f"https://github.com/{repo}/pull/{pr}"
+    return Text(url, style=f"cyan underline link {url}")
 
 
 def _thread_location(thread) -> str:
@@ -149,6 +158,7 @@ def _pr_card_with_snapshots(record: PollRecord, snapshots: dict[str, ThreadSnaps
     table.add_column("value")
 
     table.add_row(FIELD_LABEL["Status"],    _status_text(record.status))
+    table.add_row(FIELD_LABEL["Link"],      _pr_url_text(record.repo, record.pr))
     table.add_row(FIELD_LABEL["Head"],      _head_text(record.head_sha))
     table.add_row(FIELD_LABEL["CI"],        _ci_text(record.ci))
     table.add_row(FIELD_LABEL["Merge"],     _merge_text(record.merge_state))
