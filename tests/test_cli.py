@@ -342,7 +342,8 @@ def test_ledger_command_renders_table(store: StateStore, ready_poll: PollRecord)
         env={"COLUMNS": "200"},
     )
     assert result.exit_code == 0
-    assert "submit_review_approve" in result.stdout
+    # Rich may truncate the action column; assert on a prefix that survives truncation
+    assert "submit_review_appro" in result.stdout
     assert "CI green" in result.stdout
 
 
@@ -733,6 +734,23 @@ def test_rule_coverage_invalid_since_aborts_cleanly(tmp_path) -> None:
     # Typer's BadParameter exits with code 2 and prints "Invalid value for ..." to stderr
     assert result.exit_code == 2
     # The exception (if any) should be a typer error, not a bare ValueError
+    if result.exception is not None:
+        from click.exceptions import BadParameter
+        assert isinstance(result.exception, (BadParameter, SystemExit))
+
+
+# --- CHG-1105 repo argument validation (Codex P2 on PR #1) -----------------
+
+
+def test_rule_coverage_rejects_malformed_repo_argument(tmp_path) -> None:
+    """Codex P2: `swm rule-coverage owner` (no slash) must produce a clean
+    typer.BadParameter error (exit 2), not a Python ValueError traceback
+    from state.py's repo.split('/', 1)."""
+    result = runner.invoke(app, [
+        "rule-coverage", "owner",
+        "--state-dir", str(tmp_path / "empty-validation"),
+    ])
+    assert result.exit_code == 2
     if result.exception is not None:
         from click.exceptions import BadParameter
         assert isinstance(result.exception, (BadParameter, SystemExit))

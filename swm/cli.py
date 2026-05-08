@@ -27,13 +27,34 @@ app = typer.Typer(help="Sweeping-Monk PR watchdog CLI", no_args_is_help=True)
 console = Console()
 
 
+_REPO_RE = re.compile(r"^[^/]+/[^/]+$")
+
+
+def _validate_repo(value: str | None) -> str | None:
+    """Callback for typer.Argument: ensure repo looks like 'owner/name'.
+
+    None passes through (some commands accept Optional[str] repo).
+    Non-None must contain exactly one ``/`` separating non-empty owner and name.
+    Raises typer.BadParameter on malformed input so the user sees a clean
+    one-line error (exit 2) instead of a Python traceback from state.py.
+    """
+    if value is None:
+        return value
+    if not _REPO_RE.match(value):
+        raise typer.BadParameter(
+            f"expected 'owner/repo' format, got {value!r}",
+            param_hint="repo",
+        )
+    return value
+
+
 def _store(state_dir: Optional[str]) -> StateStore:
     return StateStore(Path(state_dir)) if state_dir else default_store()
 
 
 @app.command("dashboard")
 def dashboard_cmd(
-    repo: str = typer.Argument(..., help="owner/repo, e.g. frankyxhl/trinity"),
+    repo: str = typer.Argument(..., help="owner/repo, e.g. frankyxhl/trinity", callback=_validate_repo),
     state_dir: Optional[str] = typer.Option(None, "--state-dir", help="Override state/ directory (tests)"),
 ) -> None:
     """Render latest poll for each PR as rich panels."""
@@ -52,7 +73,7 @@ def dashboard_cmd(
 
 @app.command()
 def history(
-    repo: str = typer.Argument(..., help="owner/repo"),
+    repo: str = typer.Argument(..., help="owner/repo", callback=_validate_repo),
     pr: Optional[int] = typer.Option(None, "--pr", help="Filter to one PR number"),
     state_dir: Optional[str] = typer.Option(None, "--state-dir"),
 ) -> None:
@@ -68,7 +89,7 @@ def history(
 
 @app.command()
 def summary(
-    repo: str = typer.Argument(..., help="owner/repo"),
+    repo: str = typer.Argument(..., help="owner/repo", callback=_validate_repo),
     state_dir: Optional[str] = typer.Option(None, "--state-dir"),
 ) -> None:
     """One row per open PR with status + Codex resolution counts."""
@@ -82,7 +103,7 @@ def summary(
 
 @app.command("poll")
 def poll_cmd(
-    repo: str = typer.Argument(..., help="owner/repo, e.g. frankyxhl/trinity"),
+    repo: str = typer.Argument(..., help="owner/repo, e.g. frankyxhl/trinity", callback=_validate_repo),
     sync: bool = typer.Option(False, "--sync", help="Stage 1.5: resolve GitHub threads when local verdict=RESOLVED"),
     base: str = typer.Option("main", "--base", help="Base branch to filter PRs by"),
     state_dir: Optional[str] = typer.Option(None, "--state-dir"),
@@ -115,7 +136,7 @@ def _abort(message: str) -> None:
 
 @app.command("approve")
 def approve_cmd(
-    repo: str = typer.Argument(..., help="owner/repo"),
+    repo: str = typer.Argument(..., help="owner/repo", callback=_validate_repo),
     pr: int = typer.Argument(..., help="PR number"),
     reason: str = typer.Option(..., "--reason", help="One-line maintainer authorization phrase (lands in the ledger)"),
     yes: bool = typer.Option(False, "--yes", "-y", help="Skip the [y/N] confirmation prompt"),
@@ -200,7 +221,7 @@ def approve_cmd(
 
 @app.command("tick")
 def tick_cmd(
-    repo: str = typer.Argument(..., help="owner/repo"),
+    repo: str = typer.Argument(..., help="owner/repo", callback=_validate_repo),
     pr: int = typer.Argument(..., help="PR number"),
     reason: str = typer.Option(..., "--reason", help="One-line maintainer authorization phrase (lands in the ledger)"),
     yes: bool = typer.Option(False, "--yes", "-y"),
@@ -311,7 +332,7 @@ def tick_cmd(
 
 @app.command("ledger")
 def ledger_cmd(
-    repo: str = typer.Argument(..., help="owner/repo"),
+    repo: str = typer.Argument(..., help="owner/repo", callback=_validate_repo),
     pr: int = typer.Argument(..., help="PR number"),
     state_dir: Optional[str] = typer.Option(None, "--state-dir"),
 ) -> None:
@@ -354,7 +375,7 @@ def _canonicalize_box_text(text: str) -> str:
 
 @app.command("rule-coverage")
 def rule_coverage_cmd(
-    repo: Optional[str] = typer.Argument(None, help="owner/repo (optional; default: every repo)"),
+    repo: Optional[str] = typer.Argument(None, help="owner/repo (optional; default: every repo)", callback=_validate_repo),
     since: str = typer.Option("7d", "--since", help="Time window: Nd / Nh / Nm"),
     threshold: int = typer.Option(3, "--threshold", help="Hide rows with count < N"),
     state_dir: Optional[str] = typer.Option(None, "--state-dir"),
