@@ -113,7 +113,6 @@ def test_box_miss_round_trip_serialization() -> None:
         head_sha="5c53bd43289d8ca8297fffb0e93b7d42aa6892a7",
         box_text="CI ubuntu-latest passes",
         rule_id="ci.ubuntu",
-        satisfied=False,
         reason="no CI runs (paths-ignore / docs-only); parent verdict=pending",
     )
     raw = miss.model_dump_json()
@@ -122,8 +121,8 @@ def test_box_miss_round_trip_serialization() -> None:
 
 
 def test_box_miss_accepts_null_rule_id_for_coverage_gap_branch() -> None:
-    """When no BOX_RULES regex matched, rule_id is None and satisfied stays False.
-    This is the coverage-gap branch — distinct from predicate-refused."""
+    """rule_id=None is the coverage-gap branch — distinct from predicate-refused
+    where rule_id is set."""
     from datetime import datetime, timezone
     from swm.models import BoxMiss
     miss = BoxMiss(
@@ -135,4 +134,3 @@ def test_box_miss_accepts_null_rule_id_for_coverage_gap_branch() -> None:
         reason="no rule matched — manual check required",
     )
     assert miss.rule_id is None
-    assert miss.satisfied is False

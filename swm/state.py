@@ -161,8 +161,6 @@ class StateStore:
     # --- box misses (CHG-1105 classifier blind-spot visibility) -------------
 
     def append_box_miss(self, miss: BoxMiss) -> None:
-        """Append one observation of a skipped box. Append-only — the file is
-        the audit trail of classifier blind spots."""
         path = self._box_misses_path(miss.repo, miss.pr)
         path.parent.mkdir(parents=True, exist_ok=True)
         with path.open("a") as f:

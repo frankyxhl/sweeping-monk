@@ -272,7 +272,6 @@ def build_approve_ledger_entry(
 def build_box_miss(
     *, classification: BoxClassification, poll: PollRecord, ts: datetime | None = None,
 ) -> BoxMiss:
-    """One observation of a skipped box. Caller persists via store.append_box_miss."""
     return BoxMiss(
         ts=ts or now_utc(),
         repo=poll.repo,
@@ -280,7 +279,6 @@ def build_box_miss(
         head_sha=poll.head_sha,
         box_text=classification.box.text,
         rule_id=classification.rule_id,
-        satisfied=classification.satisfied,
         reason=classification.reason,
     )
 

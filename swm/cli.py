@@ -250,8 +250,9 @@ def tick_cmd(
 
     # CHG-1105: persist every skipped classification as a box-miss observation.
     # Misses are observations of what the classifier saw — recorded regardless
-    # of whether the user later confirms the flip. The maintainer's later
-    # decision doesn't change what the classifier observed at this head SHA.
+    # of whether the user later confirms the flip. `poll.head_sha == current_head`
+    # here by `supports_tick()`'s freshness gate; `build_box_miss` uses the
+    # poll's head, which is the SHA the classifier actually classified against.
     for c in classifications:
         if not c.should_flip:
             store.append_box_miss(guarded.build_box_miss(classification=c, poll=poll))
@@ -337,10 +338,11 @@ _SINCE_RE = re.compile(r"^(\d+)([dhm])$")
 
 
 def _parse_since(since: str) -> timedelta:
-    """`Nd` / `Nh` / `Nm` → timedelta. Raises ValueError on bad input."""
+    """`Nd` / `Nh` / `Nm` → timedelta. Raises typer.BadParameter on bad input
+    so the user sees a clean one-line error instead of a Python traceback."""
     m = _SINCE_RE.match(since.strip())
     if not m:
-        raise ValueError(f"--since: expected Nd / Nh / Nm, got {since!r}")
+        raise typer.BadParameter(f"expected Nd / Nh / Nm, got {since!r}", param_hint="--since")
     n, unit = int(m.group(1)), m.group(2)
     return timedelta(days=n) if unit == "d" else timedelta(hours=n) if unit == "h" else timedelta(minutes=n)
 

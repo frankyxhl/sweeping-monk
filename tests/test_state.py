@@ -233,7 +233,6 @@ def test_append_and_read_box_misses_round_trip(store: StateStore) -> None:
         head_sha="5c53bd43",
         box_text="CI ubuntu-latest passes",
         rule_id="ci.ubuntu",
-        satisfied=False,
         reason="no CI runner matching 'ubuntu'",
     )
     store.append_box_miss(miss)
@@ -251,7 +250,6 @@ def test_read_box_misses_filters_by_repo(store: StateStore) -> None:
         head_sha="abc",
         box_text="x",
         rule_id=None,
-        satisfied=False,
         reason="r",
     )
     store.append_box_miss(BoxMiss(repo="a/b", pr=1, **common))

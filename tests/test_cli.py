@@ -598,9 +598,13 @@ def test_tick_writes_misses_even_when_user_aborts_confirm(
         "--reason", "TDD test",
         "--state-dir", str(store.directory),
     ], input="n\n")
-    # Exit code should be 1 (aborted) but the miss for "Manual smoke test" must still be recorded
+    # Strict assertions per round-1 review: a future regression that short-circuits
+    # before the confirm prompt (e.g. flippable=[] → exit 0) must not silently pass.
+    assert result.exit_code == 1
+    assert "aborted" in result.stdout.lower()
     misses = list(store.read_box_misses("owner/repo"))
-    assert any(m.box_text == "Manual smoke test" for m in misses)
+    assert len(misses) == 1
+    assert misses[0].box_text == "Manual smoke test"
 
 
 def _seed_misses(store: StateStore, repo: str, pr: int, *,
@@ -613,7 +617,7 @@ def _seed_misses(store: StateStore, repo: str, pr: int, *,
     for _ in range(count):
         store.append_box_miss(BoxMiss(
             ts=base_ts, repo=repo, pr=pr, head_sha="x" * 40,
-            box_text=box_text, rule_id=rule_id, satisfied=False, reason="seeded",
+            box_text=box_text, rule_id=rule_id, reason="seeded",
         ))
 
 
@@ -701,3 +705,34 @@ def test_rule_coverage_canonicalization_keeps_distinct_runner_versions_separate(
     assert result.stdout.count("3") >= 2
     assert "ci ubuntu passes" in result.stdout.lower()
     assert "ci ubuntu-latest passes" in result.stdout.lower()
+
+
+# --- CHG-1105 round-1 review fixes -----------------------------------------
+
+
+def test_rule_coverage_threshold_not_hit_exits_clean(store: StateStore) -> None:
+    """When misses exist but none hit the threshold, exit 0 with friendly message.
+    Branch was uncovered before this test (Claude-as-GLM finding #1)."""
+    _seed_misses(store, "owner/repo", 1, box_text="Two-only", count=2, rule_id=None)
+    result = runner.invoke(app, [
+        "rule-coverage", "owner/repo",
+        "--state-dir", str(store.directory),
+    ])
+    assert result.exit_code == 0
+    assert "no patterns hit threshold" in result.stdout.lower()
+
+
+def test_rule_coverage_invalid_since_aborts_cleanly(tmp_path) -> None:
+    """Bad `--since` (e.g. '1w') must surface as a typer.BadParameter clean error,
+    not a Python traceback. Round-1 review finding (DeepSeek + Claude-as-GLM)."""
+    result = runner.invoke(app, [
+        "rule-coverage", "owner/repo",
+        "--since", "1w",
+        "--state-dir", str(tmp_path / "empty"),
+    ])
+    # Typer's BadParameter exits with code 2 and prints "Invalid value for ..." to stderr
+    assert result.exit_code == 2
+    # The exception (if any) should be a typer error, not a bare ValueError
+    if result.exception is not None:
+        from click.exceptions import BadParameter
+        assert isinstance(result.exception, (BadParameter, SystemExit))

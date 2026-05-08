@@ -291,7 +291,6 @@ def test_build_box_miss_records_unmatched_rule_branch(ready_poll):
     assert miss.head_sha == ready_poll.head_sha
     assert miss.box_text == "CHANGELOG updated"
     assert miss.rule_id is None
-    assert miss.satisfied is False
     assert "no rule matched" in miss.reason
 
 
@@ -308,7 +307,6 @@ def test_build_box_miss_records_predicate_refused_branch(pending_poll):
     )
     miss = build_box_miss(classification=classification, poll=poll)
     assert miss.rule_id == "ci.ubuntu"
-    assert miss.satisfied is False
     assert "not yet trusted" in miss.reason
 
 
