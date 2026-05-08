@@ -105,3 +105,82 @@ def _assert_transition_count(state: dict, n: int) -> None:
     # Each row begins with a timestamp prefix "2026-05-07T".
     transitions = result.stdout.count("2026-05-07T")
     assert transitions == n, f"expected {n} transitions, saw {transitions} in:\n{result.stdout}"
+
+
+# --- SWM-1104 approve scenarios ---------------------------------------------
+
+
+from tests.conftest import FakeGhClient
+
+
+@given("the PR head has since moved to a new SHA")
+def _move_head(state: dict) -> None:
+    state["current_head_sha"] = "newhead123" + "0" * 30
+
+
+@given("the PR head still matches the verdict")
+def _keep_head(state: dict, ready_poll: PollRecord) -> None:
+    state["current_head_sha"] = ready_poll.head_sha
+
+
+@when("the maintainer runs the approve command")
+def _run_approve(state: dict, monkeypatch, ready_poll: PollRecord) -> None:
+    repo = state.get("repo", ready_poll.repo)
+    pr = ready_poll.pr
+    fake = FakeGhClient(
+        prs=[{
+            "number": pr,
+            "headRefOid": state["current_head_sha"],
+            "author": {"login": "ryosaeba1985"},
+            "reviewDecision": "APPROVED",
+            "mergeStateStatus": "CLEAN",
+        }],
+        active_login="frankyxhl",
+    )
+    state["fake_gh"] = fake
+    monkeypatch.setattr("swm.cli.GhClient", lambda: fake)
+    state["result"] = runner.invoke(app, [
+        "approve", repo, str(pr),
+        "--reason", "BDD test",
+        "--yes",
+        "--state-dir", str(state["store"].directory),
+    ])
+
+
+@then("the command exits non-zero")
+def _exits_nonzero(state: dict) -> None:
+    assert state["result"].exit_code != 0
+
+
+@then("the command exits zero")
+def _exits_zero(state: dict) -> None:
+    assert state["result"].exit_code == 0, state["result"].stdout
+
+
+@then(parsers.parse('the approve output mentions "{phrase}"'))
+def _approve_output_mentions(state: dict, phrase: str) -> None:
+    assert phrase in state["result"].stdout, state["result"].stdout
+
+
+@then("no review was submitted")
+def _no_review(state: dict) -> None:
+    fake = state["fake_gh"]
+    assert [c for c in fake.calls if c[0] == "submit_review_approve"] == []
+
+
+@then("no ledger entry was written")
+def _no_ledger(state: dict, ready_poll: PollRecord) -> None:
+    repo = state.get("repo", ready_poll.repo)
+    assert state["store"].read_ledger(repo, ready_poll.pr) == []
+
+
+@then("exactly one approve review was submitted")
+def _one_review(state: dict) -> None:
+    fake = state["fake_gh"]
+    assert len([c for c in fake.calls if c[0] == "submit_review_approve"]) == 1
+
+
+@then("exactly one ledger entry was written")
+def _one_ledger(state: dict, ready_poll: PollRecord) -> None:
+    repo = state.get("repo", ready_poll.repo)
+    assert len(state["store"].read_ledger(repo, ready_poll.pr)) == 1

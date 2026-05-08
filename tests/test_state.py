@@ -1,7 +1,9 @@
 """Unit tests for StateStore — JSONL append + read, thread snapshots."""
 from __future__ import annotations
 
-from swm.models import PollRecord, ThreadSnapshot, Verdict
+from datetime import datetime, timezone
+
+from swm.models import LedgerAction, LedgerEntry, PollRecord, ThreadSnapshot, Verdict
 from swm.state import StateStore
 
 
@@ -158,6 +160,49 @@ def test_read_polls_handles_missing_log(store: StateStore) -> None:
 
     # Assert — returns empty rather than raising
     assert records == []
+
+
+def test_ledger_round_trip(store: StateStore) -> None:
+    entry = LedgerEntry(
+        ts=datetime(2026, 5, 8, 0, 55, 44, tzinfo=timezone.utc),
+        repo="frankyxhl/trinity",
+        pr=66,
+        head_sha="84d642a5e11715680a9956c20601ed709eeb995c",
+        action=LedgerAction.SUBMIT_REVIEW_APPROVE,
+        actor="frankyxhl",
+        authorized_by="maintainer (interactive --reason='one-shot test')",
+        reason="CI green, Codex 👍",
+        evidence={"verdict": "ready"},
+        result={"reviewDecision": "APPROVED"},
+    )
+    store.append_ledger(entry)
+    store.append_ledger(entry.model_copy(update={"action": LedgerAction.EDIT_PR_BODY_CHECK_BOXES}))
+
+    out = store.read_ledger("frankyxhl/trinity", 66)
+    assert len(out) == 2
+    assert out[0].action == LedgerAction.SUBMIT_REVIEW_APPROVE
+    assert out[1].action == LedgerAction.EDIT_PR_BODY_CHECK_BOXES
+
+
+def test_ledger_read_returns_empty_when_missing(store: StateStore) -> None:
+    assert store.read_ledger("frankyxhl/nope", 1) == []
+
+
+def test_ledger_accepts_legacy_extra_fields(store: StateStore) -> None:
+    """Manually-written ledger entries (pre-CHG-1104) used top-level extra keys
+    like `boxes_flipped` / `diff_lines_changed`. Extra='allow' must keep them readable."""
+    legacy_path = store._ledger_path("legacy/repo", 7)
+    legacy_path.parent.mkdir(parents=True, exist_ok=True)
+    legacy_path.write_text(
+        '{"ts":"2026-05-08T00:57:42Z","repo":"legacy/repo","pr":7,"head_sha":"abc","'
+        'action":"edit_pr_body_check_boxes","actor":"frankyxhl",'
+        '"authorized_by":"maintainer","reason":"r","boxes_flipped":["A12"],"diff_lines_changed":4}\n'
+    )
+    out = store.read_ledger("legacy/repo", 7)
+    assert len(out) == 1
+    assert out[0].action == LedgerAction.EDIT_PR_BODY_CHECK_BOXES
+    # Extra fields preserved on the model via extra='allow'
+    assert getattr(out[0], "boxes_flipped", None) == ["A12"]
 
 
 def test_append_poll_skips_blank_lines(store: StateStore, pending_poll: PollRecord) -> None:

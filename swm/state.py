@@ -22,7 +22,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Iterator
 
-from .models import PollRecord, ThreadSnapshot
+from .models import LedgerEntry, PollRecord, ThreadSnapshot
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_STATE_DIR = REPO_ROOT / "state"
@@ -61,6 +61,9 @@ class StateStore:
 
     def _thread_path(self, repo: str, pr: int, thread_id: str) -> Path:
         return self._pr_dir(repo, pr) / "threads" / f"{thread_id}.jsonl"
+
+    def _ledger_path(self, repo: str, pr: int) -> Path:
+        return self._pr_dir(repo, pr) / "ledger.jsonl"
 
     # --- polls ---------------------------------------------------------------
 
@@ -134,6 +137,22 @@ class StateStore:
         return [
             ThreadSnapshot.model_validate_json(line)
             for line in _read_jsonl(self._thread_path(repo, pr, thread_id))
+        ]
+
+    # --- ledger (SWM-1103 audit trail of one-shot writes) --------------------
+
+    def append_ledger(self, entry: LedgerEntry) -> None:
+        """Append one Stage-3+ write record to ledger.jsonl. Never overwritten."""
+        path = self._ledger_path(entry.repo, entry.pr)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("a") as f:
+            f.write(entry.model_dump_json() + "\n")
+
+    def read_ledger(self, repo: str, pr: int) -> list[LedgerEntry]:
+        """Every ledger entry for this PR, oldest-first. Empty when missing."""
+        return [
+            LedgerEntry.model_validate_json(line)
+            for line in _read_jsonl(self._ledger_path(repo, pr))
         ]
 
 

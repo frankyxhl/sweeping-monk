@@ -133,3 +133,217 @@ def test_poll_command_says_no_open_prs_when_repo_is_empty(
     # Assert
     assert result.exit_code == 0
     assert "no open PRs" in result.stdout
+
+
+# --- SWM-1104 guarded subcommand tests --------------------------------------
+
+
+SAMPLE_PR_BODY = """## Test plan
+
+- [ ] CI ubuntu-latest passes
+- [ ] CI macos-latest passes
+- [ ] Codex GitHub bot review
+- [ ] Manual smoke on staging
+"""
+
+
+def test_approve_refuses_when_no_poll(store: StateStore, monkeypatch) -> None:
+    from tests.conftest import FakeGhClient
+    fake = FakeGhClient(
+        prs=[{"number": 66, "headRefOid": "abc12345" + "0" * 32, "author": {"login": "ryosaeba1985"}}],
+        active_login="frankyxhl",
+    )
+    monkeypatch.setattr("swm.cli.GhClient", lambda: fake)
+    result = runner.invoke(app, [
+        "approve", "owner/repo", "66",
+        "--reason", "test",
+        "--yes",
+        "--state-dir", str(store.directory),
+    ])
+    assert result.exit_code == 1
+    assert "no recorded poll" in result.stdout
+
+
+def test_approve_refuses_on_self_action(store: StateStore, monkeypatch, ready_poll: PollRecord) -> None:
+    from tests.conftest import FakeGhClient
+    poll = ready_poll.model_copy(update={"repo": "owner/repo", "pr": 66})
+    store.append_poll(poll)
+    fake = FakeGhClient(
+        prs=[{"number": 66, "headRefOid": poll.head_sha, "author": {"login": "ryosaeba1985"}}],
+        active_login="ryosaeba1985",
+    )
+    monkeypatch.setattr("swm.cli.GhClient", lambda: fake)
+    result = runner.invoke(app, [
+        "approve", "owner/repo", "66",
+        "--reason", "test",
+        "--yes",
+        "--state-dir", str(store.directory),
+    ])
+    assert result.exit_code == 1
+    assert "self-approval" in result.stdout
+
+
+def test_approve_refuses_on_stale_head_sha(store: StateStore, monkeypatch, ready_poll: PollRecord) -> None:
+    from tests.conftest import FakeGhClient
+    poll = ready_poll.model_copy(update={"repo": "owner/repo", "pr": 66})
+    store.append_poll(poll)
+    fake = FakeGhClient(
+        prs=[{"number": 66, "headRefOid": "newhead123" + "0" * 30, "author": {"login": "someone"}}],
+        active_login="frankyxhl",
+    )
+    monkeypatch.setattr("swm.cli.GhClient", lambda: fake)
+    result = runner.invoke(app, [
+        "approve", "owner/repo", "66",
+        "--reason", "test",
+        "--yes",
+        "--state-dir", str(store.directory),
+    ])
+    assert result.exit_code == 1
+    assert "re-poll first" in result.stdout
+
+
+def test_approve_happy_path_writes_ledger(store: StateStore, monkeypatch, ready_poll: PollRecord) -> None:
+    from tests.conftest import FakeGhClient
+    poll = ready_poll.model_copy(update={"repo": "owner/repo", "pr": 66, "codex_pr_body_signal": "approved"})
+    store.append_poll(poll)
+    fake = FakeGhClient(
+        prs=[{
+            "number": 66, "headRefOid": poll.head_sha,
+            "author": {"login": "ryosaeba1985"},
+            "reviewDecision": "APPROVED", "mergeStateStatus": "CLEAN",
+        }],
+        active_login="frankyxhl",
+    )
+    monkeypatch.setattr("swm.cli.GhClient", lambda: fake)
+    result = runner.invoke(app, [
+        "approve", "owner/repo", "66",
+        "--reason", "CI green + Codex 👍, head fresh",
+        "--yes",
+        "--state-dir", str(store.directory),
+    ])
+    assert result.exit_code == 0
+    assert "APPROVED" in result.stdout
+    submitted = [c for c in fake.calls if c[0] == "submit_review_approve"]
+    assert len(submitted) == 1
+    ledger = store.read_ledger("owner/repo", 66)
+    assert len(ledger) == 1
+    assert ledger[0].head_sha == poll.head_sha
+
+
+def test_approve_does_not_ledger_when_review_call_fails(
+    store: StateStore, monkeypatch, ready_poll: PollRecord
+) -> None:
+    from tests.conftest import FakeGhClient
+    poll = ready_poll.model_copy(update={"repo": "owner/repo", "pr": 66})
+    store.append_poll(poll)
+    fake = FakeGhClient(
+        prs=[{"number": 66, "headRefOid": poll.head_sha, "author": {"login": "ryosaeba1985"}}],
+        active_login="frankyxhl",
+        review_should_fail=True,
+    )
+    monkeypatch.setattr("swm.cli.GhClient", lambda: fake)
+    result = runner.invoke(app, [
+        "approve", "owner/repo", "66",
+        "--reason", "test",
+        "--yes",
+        "--state-dir", str(store.directory),
+    ])
+    assert result.exit_code == 1
+    assert store.read_ledger("owner/repo", 66) == []
+
+
+def test_tick_flips_only_satisfied_boxes(store: StateStore, monkeypatch, ready_poll: PollRecord) -> None:
+    from tests.conftest import FakeGhClient
+    poll = ready_poll.model_copy(update={"repo": "owner/repo", "pr": 66, "codex_pr_body_signal": "approved"})
+    store.append_poll(poll)
+    fake = FakeGhClient(
+        prs=[{"number": 66, "headRefOid": poll.head_sha, "author": {"login": "ryosaeba1985"}}],
+        active_login="frankyxhl",
+        pr_bodies={66: SAMPLE_PR_BODY},
+    )
+    monkeypatch.setattr("swm.cli.GhClient", lambda: fake)
+    result = runner.invoke(app, [
+        "tick", "owner/repo", "66",
+        "--yes",
+        "--state-dir", str(store.directory),
+    ])
+    assert result.exit_code == 0
+    edits = [c for c in fake.calls if c[0] == "edit_pr_body"]
+    assert len(edits) == 1
+    new_body = edits[0][2]["body"]
+    # 3 of 4 boxes should be flipped (manual smoke skipped)
+    assert new_body.count("- [x]") == 3
+    assert "- [ ] Manual smoke" in new_body
+    ledger = store.read_ledger("owner/repo", 66)
+    assert len(ledger) == 1
+    assert ledger[0].evidence["boxes_flipped"][0]["rule"] in {"ci.ubuntu", "ci.macos", "codex.review"}
+
+
+def test_tick_no_op_when_no_unchecked_boxes(store: StateStore, monkeypatch, ready_poll: PollRecord) -> None:
+    from tests.conftest import FakeGhClient
+    poll = ready_poll.model_copy(update={"repo": "owner/repo", "pr": 66})
+    store.append_poll(poll)
+    fake = FakeGhClient(
+        prs=[{"number": 66, "headRefOid": poll.head_sha, "author": {"login": "ryosaeba1985"}}],
+        active_login="frankyxhl",
+        pr_bodies={66: "# all done\n\n- [x] one\n- [x] two\n"},
+    )
+    monkeypatch.setattr("swm.cli.GhClient", lambda: fake)
+    result = runner.invoke(app, [
+        "tick", "owner/repo", "66",
+        "--yes",
+        "--state-dir", str(store.directory),
+    ])
+    assert result.exit_code == 0
+    assert "no unchecked boxes" in result.stdout
+    assert [c for c in fake.calls if c[0] == "edit_pr_body"] == []
+
+
+def test_tick_no_flippable_when_only_unverifiable_boxes(
+    store: StateStore, monkeypatch, ready_poll: PollRecord
+) -> None:
+    from tests.conftest import FakeGhClient
+    poll = ready_poll.model_copy(update={"repo": "owner/repo", "pr": 66})
+    store.append_poll(poll)
+    body = "- [ ] Manual review\n- [ ] Stakeholder approval\n"
+    fake = FakeGhClient(
+        prs=[{"number": 66, "headRefOid": poll.head_sha, "author": {"login": "ryosaeba1985"}}],
+        active_login="frankyxhl",
+        pr_bodies={66: body},
+    )
+    monkeypatch.setattr("swm.cli.GhClient", lambda: fake)
+    result = runner.invoke(app, [
+        "tick", "owner/repo", "66",
+        "--yes",
+        "--state-dir", str(store.directory),
+    ])
+    assert result.exit_code == 0
+    assert "nothing to flip" in result.stdout
+    assert [c for c in fake.calls if c[0] == "edit_pr_body"] == []
+
+
+def test_ledger_command_renders_table(store: StateStore, ready_poll: PollRecord) -> None:
+    from datetime import datetime, timezone
+    from swm.models import LedgerAction, LedgerEntry
+    poll = ready_poll.model_copy(update={"repo": "owner/repo", "pr": 66})
+    entry = LedgerEntry(
+        ts=datetime(2026, 5, 8, 0, 55, 44, tzinfo=timezone.utc),
+        repo=poll.repo, pr=poll.pr, head_sha=poll.head_sha,
+        action=LedgerAction.SUBMIT_REVIEW_APPROVE,
+        actor="frankyxhl", authorized_by="maintainer",
+        reason="CI green",
+    )
+    store.append_ledger(entry)
+    result = runner.invoke(
+        app, ["ledger", "owner/repo", "66", "--state-dir", str(store.directory)],
+        env={"COLUMNS": "200"},
+    )
+    assert result.exit_code == 0
+    assert "submit_review_approve" in result.stdout
+    assert "CI green" in result.stdout
+
+
+def test_ledger_command_says_empty_when_no_entries(store: StateStore) -> None:
+    result = runner.invoke(app, ["ledger", "owner/repo", "66", "--state-dir", str(store.directory)])
+    assert result.exit_code == 0
+    assert "no ledger entries" in result.stdout

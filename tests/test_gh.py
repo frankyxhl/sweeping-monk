@@ -159,3 +159,80 @@ def test_command_error_raises_for_non_404_failures() -> None:
     # Act / Assert
     with pytest.raises(GhCommandError, match="rate limit"):
         client.list_open_prs("owner/repo")
+
+
+# --- SWM-1104 / SWM-1103 one-shot writes -------------------------------------
+
+
+AUTH_STATUS_OUTPUT = """github.com
+  ✓ Logged in to github.com account ryosaeba1985 (keyring)
+  - Active account: true
+  - Token: gho_*****
+  ✓ Logged in to github.com account frankyxhl (keyring)
+  - Active account: false
+"""
+
+
+def test_auth_active_login_parses_active_account() -> None:
+    runner = StubRunner()
+    runner.expect(("auth", "status"), stdout=AUTH_STATUS_OUTPUT)
+    gh = GhClient(runner=runner)
+    assert gh.auth_active_login() == "ryosaeba1985"
+
+
+def test_auth_active_login_falls_back_to_stderr() -> None:
+    """gh emits the status to stderr in some versions."""
+    runner = StubRunner()
+    runner.expect(("auth", "status"), stderr=AUTH_STATUS_OUTPUT)
+    gh = GhClient(runner=runner)
+    assert gh.auth_active_login() == "ryosaeba1985"
+
+
+def test_auth_active_login_raises_when_unparseable() -> None:
+    runner = StubRunner()
+    runner.expect(("auth", "status"), stdout="totally garbled")
+    gh = GhClient(runner=runner)
+    with pytest.raises(GhCommandError, match="could not determine active gh account"):
+        gh.auth_active_login()
+
+
+def test_submit_review_approve_calls_gh_pr_review_approve() -> None:
+    runner = StubRunner()
+    runner.expect(("pr", "review", "66"), stdout="approved")
+    gh = GhClient(runner=runner)
+    out = gh.submit_review_approve("frankyxhl/trinity", 66, body="Approved.")
+    assert out["stdout"] == "approved"
+    submitted = runner.calls[-1]
+    assert "--approve" in submitted
+    assert "--body" in submitted
+
+
+def test_submit_review_approve_raises_on_gh_failure() -> None:
+    runner = StubRunner()
+    runner.expect(("pr", "review", "66"), code=1, stderr="GraphQL: Could not resolve")
+    gh = GhClient(runner=runner)
+    with pytest.raises(GhCommandError, match="gh pr review --approve failed"):
+        gh.submit_review_approve("frankyxhl/trinity", 66, body="x")
+
+
+def test_edit_pr_body_uses_body_file_and_cleans_up(tmp_path) -> None:
+    """The temp file passed to gh pr edit must be deleted after the call."""
+    runner = StubRunner()
+    runner.expect(("pr", "edit", "66"), stdout="edited")
+    gh = GhClient(runner=runner)
+    out = gh.edit_pr_body("frankyxhl/trinity", 66, body="new body content")
+    assert out["stdout"] == "edited"
+    submitted = runner.calls[-1]
+    assert "--body-file" in submitted
+    body_file_path = submitted[submitted.index("--body-file") + 1]
+    # Temp file should have been cleaned up
+    import os
+    assert not os.path.exists(body_file_path)
+
+
+def test_edit_pr_body_raises_on_gh_failure() -> None:
+    runner = StubRunner()
+    runner.expect(("pr", "edit", "66"), code=1, stderr="permission denied")
+    gh = GhClient(runner=runner)
+    with pytest.raises(GhCommandError, match="gh pr edit --body-file failed"):
+        gh.edit_pr_body("frankyxhl/trinity", 66, body="x")

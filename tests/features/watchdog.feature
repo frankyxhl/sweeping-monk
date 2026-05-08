@@ -34,3 +34,24 @@ Feature: PR watchdog reports actionable status to the maintainer
     When the maintainer runs the dashboard command
     Then the output shows status READY
     And the output mentions "👍 approved"
+
+  Scenario: SWM-1103 — approve refuses when head SHA has moved since the verdict
+    Given a clean state directory
+    And a poll for PR #49 with status pending and 1 open Codex thread
+    And a later poll for PR #49 with status ready and the thread resolved
+    And the PR head has since moved to a new SHA
+    When the maintainer runs the approve command
+    Then the command exits non-zero
+    And the approve output mentions "re-poll first"
+    And no review was submitted
+    And no ledger entry was written
+
+  Scenario: SWM-1103 — approve happy path appends a ledger entry
+    Given a clean state directory
+    And a poll for PR #49 with status pending and 1 open Codex thread
+    And a later poll for PR #49 with status ready and the thread resolved
+    And the PR head still matches the verdict
+    When the maintainer runs the approve command
+    Then the command exits zero
+    And exactly one approve review was submitted
+    And exactly one ledger entry was written

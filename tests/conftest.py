@@ -132,12 +132,20 @@ class FakeGhClient(GhClient):
     def __init__(self, *, prs: list[dict] | None = None,
                  review_threads: dict[int, list[dict]] | None = None,
                  branch_protection_data: dict | None = None,
-                 pr_body_reactions: dict[int, list[dict]] | None = None) -> None:
+                 pr_body_reactions: dict[int, list[dict]] | None = None,
+                 active_login: str = "ryosaeba1985",
+                 pr_bodies: dict[int, str] | None = None,
+                 review_should_fail: bool = False,
+                 edit_should_fail: bool = False) -> None:
         # Skip parent __init__ — we override every public method.
         self._prs = prs or []
         self._review_threads = review_threads or {}
         self._branch_protection = branch_protection_data
         self._pr_body_reactions = pr_body_reactions or {}
+        self._active_login = active_login
+        self._pr_bodies = pr_bodies or {}
+        self._review_should_fail = review_should_fail
+        self._edit_should_fail = edit_should_fail
         self.calls: list[tuple[str, tuple, dict]] = []
 
     def _record(self, name: str, *args: Any, **kwargs: Any) -> None:
@@ -149,7 +157,10 @@ class FakeGhClient(GhClient):
 
     def view_pr(self, repo: str, pr: int, fields: list[str]) -> dict:
         self._record("view_pr", repo, pr, fields=fields)
-        return next((p for p in self._prs if p.get("number") == pr), {})
+        base = next((p for p in self._prs if p.get("number") == pr), {})
+        if pr in self._pr_bodies:
+            base = {**base, "body": self._pr_bodies[pr]}
+        return base
 
     def pulls_comments(self, repo: str, pr: int) -> list[dict]:
         self._record("pulls_comments", repo, pr)
@@ -178,6 +189,26 @@ class FakeGhClient(GhClient):
     def unresolve_thread(self, thread_id: str) -> dict:
         self._record("unresolve_thread", thread_id)
         return {"id": thread_id, "isResolved": False}
+
+    def auth_active_login(self) -> str:
+        self._record("auth_active_login")
+        return self._active_login
+
+    def submit_review_approve(self, repo: str, pr: int, body: str) -> dict:
+        self._record("submit_review_approve", repo, pr, body=body)
+        if self._review_should_fail:
+            from swm.gh import GhCommandError
+            raise GhCommandError("simulated review failure")
+        return {"stdout": "approved"}
+
+    def edit_pr_body(self, repo: str, pr: int, body: str) -> dict:
+        self._record("edit_pr_body", repo, pr, body=body)
+        if self._edit_should_fail:
+            from swm.gh import GhCommandError
+            raise GhCommandError("simulated edit failure")
+        # Mirror the edit into pr_bodies so subsequent view_pr sees the new body.
+        self._pr_bodies[pr] = body
+        return {"stdout": "edited"}
 
 
 @pytest.fixture

@@ -139,6 +139,31 @@ class GitHubThreadState(BaseModel):
     synced_at: datetime | None = None
 
 
+class LedgerAction(str, Enum):
+    SUBMIT_REVIEW_APPROVE = "submit_review_approve"
+    EDIT_PR_BODY_CHECK_BOXES = "edit_pr_body_check_boxes"
+
+
+class LedgerEntry(BaseModel):
+    """One Stage-3+ write the watchdog made under SWM-1103 authorization.
+
+    Append-only — never mutated. Older hand-written entries in `ledger.jsonl`
+    may carry extra top-level fields; `extra="allow"` keeps them readable.
+    """
+    model_config = ConfigDict(extra="allow")
+
+    ts: datetime
+    repo: str
+    pr: int
+    head_sha: str
+    action: LedgerAction
+    actor: str
+    authorized_by: str
+    reason: str
+    evidence: dict = Field(default_factory=dict)
+    result: dict = Field(default_factory=dict)
+
+
 class ThreadSnapshot(BaseModel):
     """One thread's full living state in state/threads/<id>.json — overwritten on each poll."""
     model_config = ConfigDict(extra="allow")

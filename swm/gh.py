@@ -7,7 +7,10 @@ runner shells out to `gh` via subprocess.
 from __future__ import annotations
 
 import json
+import os
+import re
 import subprocess
+import tempfile
 from dataclasses import dataclass
 from typing import Callable
 
@@ -165,3 +168,45 @@ class GhClient:
         args = ["api", "graphql", "-f", f"query={UNRESOLVE_MUTATION}", "-F", f"threadId={thread_id}"]
         data = self._json(args) or {}
         return dict(data.get("data", {}).get("unresolveReviewThread", {}).get("thread", {}))
+
+    # --- SWM-1103 one-shot writes -------------------------------------------
+
+    def auth_active_login(self) -> str:
+        """Return the active gh account login. Raises GhCommandError on parse failure."""
+        result = self._run(["auth", "status"])
+        if result.returncode != 0:
+            raise GhCommandError(f"gh auth status failed: {result.stderr.strip() or result.stdout.strip()}")
+        # gh prints to stderr historically; merging both is robust across versions.
+        text = (result.stdout or "") + "\n" + (result.stderr or "")
+        current_account: str | None = None
+        for line in text.splitlines():
+            m = re.search(r"Logged in to .+ account (\S+)", line)
+            if m:
+                current_account = m.group(1)
+            if "Active account: true" in line and current_account:
+                return current_account
+        raise GhCommandError("could not determine active gh account from `gh auth status` output")
+
+    def submit_review_approve(self, repo: str, pr: int, body: str) -> dict:
+        """Stage-3 — caller is responsible for SWM-1103 gates. Returns raw stdout dict."""
+        result = self._run(["pr", "review", str(pr), "--repo", repo, "--approve", "--body", body])
+        if result.returncode != 0:
+            raise GhCommandError(f"gh pr review --approve failed: {result.stderr.strip()}")
+        return {"stdout": result.stdout.strip(), "stderr": result.stderr.strip()}
+
+    def edit_pr_body(self, repo: str, pr: int, body: str) -> dict:
+        """Stage-3 — replaces the entire PR body via --body-file (no arg expansion).
+        Caller is responsible for ensuring the new body matches an audited diff."""
+        fd, path = tempfile.mkstemp(suffix=".md", prefix="swm-pr-body-")
+        try:
+            with os.fdopen(fd, "w") as f:
+                f.write(body)
+            result = self._run(["pr", "edit", str(pr), "--repo", repo, "--body-file", path])
+            if result.returncode != 0:
+                raise GhCommandError(f"gh pr edit --body-file failed: {result.stderr.strip()}")
+            return {"stdout": result.stdout.strip(), "stderr": result.stderr.strip()}
+        finally:
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
