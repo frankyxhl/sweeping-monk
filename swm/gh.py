@@ -188,11 +188,24 @@ class GhClient:
         raise GhCommandError("could not determine active gh account from `gh auth status` output")
 
     def submit_review_approve(self, repo: str, pr: int, body: str) -> dict:
-        """Stage-3 — caller is responsible for SWM-1103 gates. Returns raw stdout dict."""
-        result = self._run(["pr", "review", str(pr), "--repo", repo, "--approve", "--body", body])
-        if result.returncode != 0:
-            raise GhCommandError(f"gh pr review --approve failed: {result.stderr.strip()}")
-        return {"stdout": result.stdout.strip(), "stderr": result.stderr.strip()}
+        """Stage-3 — caller is responsible for SWM-1103 gates. Returns raw stdout dict.
+
+        Body passes via --body-file (tempfile) so arbitrary maintainer text is never
+        subject to shell quoting / ARG_MAX. Mirrors edit_pr_body.
+        """
+        fd, path = tempfile.mkstemp(suffix=".md", prefix="swm-review-body-")
+        try:
+            with os.fdopen(fd, "w") as f:
+                f.write(body)
+            result = self._run(["pr", "review", str(pr), "--repo", repo, "--approve", "--body-file", path])
+            if result.returncode != 0:
+                raise GhCommandError(f"gh pr review --approve failed: {result.stderr.strip()}")
+            return {"stdout": result.stdout.strip(), "stderr": result.stderr.strip()}
+        finally:
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
 
     def edit_pr_body(self, repo: str, pr: int, body: str) -> dict:
         """Stage-3 — replaces the entire PR body via --body-file (no arg expansion).

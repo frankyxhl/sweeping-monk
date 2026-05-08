@@ -163,6 +163,19 @@ def approve_cmd(
         console.print("[yellow]aborted[/yellow]")
         raise typer.Exit(code=1)
 
+    # TOCTOU re-fetch (CHG-1104 §Risks row 1): the head SHA could have moved
+    # while the maintainer was reading the prompt. Re-read immediately before
+    # the review call and refuse if it drifted.
+    try:
+        recheck = gh_client.view_pr(repo, pr, ["headRefOid"])
+    except GhCommandError as exc:
+        _abort(str(exc))
+    if recheck.get("headRefOid", "") != current_head:
+        _abort(
+            f"head SHA drifted during confirmation: {current_head[:8]} → "
+            f"{(recheck.get('headRefOid') or '')[:8]} — re-poll first"
+        )
+
     try:
         review_result = gh_client.submit_review_approve(repo, pr, body)
         verify = gh_client.view_pr(repo, pr, ["reviewDecision", "mergeStateStatus"])
@@ -188,7 +201,7 @@ def approve_cmd(
 def tick_cmd(
     repo: str = typer.Argument(..., help="owner/repo"),
     pr: int = typer.Argument(..., help="PR number"),
-    reason: str = typer.Option("auto-tick: factually-satisfied boxes", "--reason"),
+    reason: str = typer.Option(..., "--reason", help="One-line maintainer authorization phrase (lands in the ledger)"),
     yes: bool = typer.Option(False, "--yes", "-y"),
     state_dir: Optional[str] = typer.Option(None, "--state-dir"),
 ) -> None:
@@ -215,6 +228,8 @@ def tick_cmd(
         _abort(str(exc))
     verdict = guarded.check_verdict(store, repo, pr, current_head)
     blockers: list[str] = []
+    if identity.blocker:
+        blockers.append(identity.blocker)
     ok, why = verdict.supports_tick()
     if not ok and why:
         blockers.append(why)

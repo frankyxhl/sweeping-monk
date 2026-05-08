@@ -264,6 +264,7 @@ def test_tick_flips_only_satisfied_boxes(store: StateStore, monkeypatch, ready_p
     monkeypatch.setattr("swm.cli.GhClient", lambda: fake)
     result = runner.invoke(app, [
         "tick", "owner/repo", "66",
+        "--reason", "BDD test",
         "--yes",
         "--state-dir", str(store.directory),
     ])
@@ -291,6 +292,7 @@ def test_tick_no_op_when_no_unchecked_boxes(store: StateStore, monkeypatch, read
     monkeypatch.setattr("swm.cli.GhClient", lambda: fake)
     result = runner.invoke(app, [
         "tick", "owner/repo", "66",
+        "--reason", "BDD test",
         "--yes",
         "--state-dir", str(store.directory),
     ])
@@ -314,6 +316,7 @@ def test_tick_no_flippable_when_only_unverifiable_boxes(
     monkeypatch.setattr("swm.cli.GhClient", lambda: fake)
     result = runner.invoke(app, [
         "tick", "owner/repo", "66",
+        "--reason", "BDD test",
         "--yes",
         "--state-dir", str(store.directory),
     ])
@@ -347,3 +350,133 @@ def test_ledger_command_says_empty_when_no_entries(store: StateStore) -> None:
     result = runner.invoke(app, ["ledger", "owner/repo", "66", "--state-dir", str(store.directory)])
     assert result.exit_code == 0
     assert "no ledger entries" in result.stdout
+
+
+# --- SWM-1104 fix-cycle tests (named in CHG §Risks but originally missing) --
+
+
+def test_approve_refuses_on_head_sha_drift_during_confirmation(
+    store: StateStore, monkeypatch, ready_poll: PollRecord
+) -> None:
+    """TOCTOU mitigation: head SHA must be re-checked between user confirm and gh review.
+
+    The first view_pr returns the verdict's head; the recheck after confirmation
+    returns a different head — approve must abort and skip the ledger.
+    """
+    from tests.conftest import FakeGhClient
+    poll = ready_poll.model_copy(update={"repo": "owner/repo", "pr": 66})
+    store.append_poll(poll)
+
+    # Custom FakeGhClient that flips headRefOid on the second view_pr call.
+    class FlippingGh(FakeGhClient):
+        def view_pr(self, repo, pr, fields):
+            self._record("view_pr", repo, pr, fields=fields)
+            call_index = sum(1 for c in self.calls if c[0] == "view_pr")
+            if call_index >= 2 and "headRefOid" in fields:
+                # Simulated drift on the recheck.
+                return {"number": pr, "headRefOid": "drifted456" + "0" * 30, "author": {"login": "ryosaeba1985"}}
+            return {"number": pr, "headRefOid": poll.head_sha, "author": {"login": "ryosaeba1985"}}
+
+    fake = FlippingGh(active_login="frankyxhl")
+    monkeypatch.setattr("swm.cli.GhClient", lambda: fake)
+    result = runner.invoke(app, [
+        "approve", "owner/repo", "66",
+        "--reason", "test",
+        "--yes",
+        "--state-dir", str(store.directory),
+    ])
+    assert result.exit_code == 1
+    assert "drifted during confirmation" in result.stdout
+    # Crucial: no review submitted, no ledger written
+    assert [c for c in fake.calls if c[0] == "submit_review_approve"] == []
+    assert store.read_ledger("owner/repo", 66) == []
+
+
+def test_tick_refuses_on_self_action(store: StateStore, monkeypatch, ready_poll: PollRecord) -> None:
+    """Fix #1: tick must respect identity.blocker — self-author can't edit own PR body."""
+    from tests.conftest import FakeGhClient
+    poll = ready_poll.model_copy(update={"repo": "owner/repo", "pr": 66})
+    store.append_poll(poll)
+    fake = FakeGhClient(
+        prs=[{"number": 66, "headRefOid": poll.head_sha, "author": {"login": "ryosaeba1985"}}],
+        active_login="ryosaeba1985",  # same as PR author => self-action
+        pr_bodies={66: "- [ ] CI ubuntu-latest passes\n"},
+    )
+    monkeypatch.setattr("swm.cli.GhClient", lambda: fake)
+    result = runner.invoke(app, [
+        "tick", "owner/repo", "66",
+        "--reason", "should be blocked",
+        "--yes",
+        "--state-dir", str(store.directory),
+    ])
+    assert result.exit_code == 1
+    assert "self-approval" in result.stdout or "self" in result.stdout.lower()
+    assert [c for c in fake.calls if c[0] == "edit_pr_body"] == []
+    assert store.read_ledger("owner/repo", 66) == []
+
+
+def test_tick_does_not_ledger_when_body_diff_mismatches(
+    store: StateStore, monkeypatch, ready_poll: PollRecord
+) -> None:
+    """Fix: tick verifies post-edit body matches the prepared diff; if not, refuse to ledger.
+
+    Simulated by a FakeGhClient that pretends to edit but actually returns a different body
+    on the verify view_pr call.
+    """
+    from tests.conftest import FakeGhClient
+    poll = ready_poll.model_copy(update={"repo": "owner/repo", "pr": 66, "codex_pr_body_signal": "approved"})
+    store.append_poll(poll)
+    body = "- [ ] CI ubuntu-latest passes\n"
+
+    class TamperingGh(FakeGhClient):
+        def edit_pr_body(self, repo, pr, body):
+            self._record("edit_pr_body", repo, pr, body=body)
+            # Simulate: gh edit returns success, but the next view_pr shows a DIFFERENT body
+            # (e.g. someone else edited concurrently). We MUST refuse to ledger.
+            self._pr_bodies[pr] = body + "\n[concurrent edit landed]\n"
+            return {"stdout": "edited"}
+
+    fake = TamperingGh(
+        prs=[{"number": 66, "headRefOid": poll.head_sha, "author": {"login": "ryosaeba1985"}}],
+        active_login="frankyxhl",
+        pr_bodies={66: body},
+    )
+    monkeypatch.setattr("swm.cli.GhClient", lambda: fake)
+    result = runner.invoke(app, [
+        "tick", "owner/repo", "66",
+        "--reason", "test",
+        "--yes",
+        "--state-dir", str(store.directory),
+    ])
+    assert result.exit_code == 1
+    assert "post-edit body does not match" in result.stdout
+    # Crucial: edit was attempted (and "succeeded"), but no ledger was written
+    assert len([c for c in fake.calls if c[0] == "edit_pr_body"]) == 1
+    assert store.read_ledger("owner/repo", 66) == []
+
+
+def test_approve_does_not_ledger_when_review_call_fails_with_drift_error(
+    store: StateStore, monkeypatch, ready_poll: PollRecord
+) -> None:
+    """Symmetric to test_approve_does_not_ledger_when_review_call_fails but
+    distinguishes pre-call drift abort from gh-call-failed abort. Both must
+    leave the ledger empty."""
+    from tests.conftest import FakeGhClient
+    poll = ready_poll.model_copy(update={"repo": "owner/repo", "pr": 66})
+    store.append_poll(poll)
+    fake = FakeGhClient(
+        prs=[{"number": 66, "headRefOid": poll.head_sha, "author": {"login": "ryosaeba1985"}}],
+        active_login="frankyxhl",
+        review_should_fail=True,  # post-confirmation gh failure
+    )
+    monkeypatch.setattr("swm.cli.GhClient", lambda: fake)
+    result = runner.invoke(app, [
+        "approve", "owner/repo", "66",
+        "--reason", "test",
+        "--yes",
+        "--state-dir", str(store.directory),
+    ])
+    assert result.exit_code == 1
+    # Review WAS attempted, but ledger must remain empty
+    assert len([c for c in fake.calls if c[0] == "submit_review_approve"]) == 1
+    assert store.read_ledger("owner/repo", 66) == []

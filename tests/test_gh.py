@@ -196,15 +196,20 @@ def test_auth_active_login_raises_when_unparseable() -> None:
         gh.auth_active_login()
 
 
-def test_submit_review_approve_calls_gh_pr_review_approve() -> None:
+def test_submit_review_approve_uses_body_file_not_arg_expansion() -> None:
+    """SWM-1104 fix: arbitrary maintainer text must go through --body-file (no shell expansion)."""
     runner = StubRunner()
     runner.expect(("pr", "review", "66"), stdout="approved")
     gh = GhClient(runner=runner)
-    out = gh.submit_review_approve("frankyxhl/trinity", 66, body="Approved.")
+    out = gh.submit_review_approve("frankyxhl/trinity", 66, body="Approved with `backticks` and 'quotes'.")
     assert out["stdout"] == "approved"
     submitted = runner.calls[-1]
     assert "--approve" in submitted
-    assert "--body" in submitted
+    assert "--body-file" in submitted
+    assert "--body" not in submitted  # only --body-file, not --body
+    body_file_path = submitted[submitted.index("--body-file") + 1]
+    import os as _os
+    assert not _os.path.exists(body_file_path), "tempfile must be cleaned up after the call"
 
 
 def test_submit_review_approve_raises_on_gh_failure() -> None:
