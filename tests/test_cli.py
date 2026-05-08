@@ -480,3 +480,224 @@ def test_approve_does_not_ledger_when_review_call_fails_with_drift_error(
     # Review WAS attempted, but ledger must remain empty
     assert len([c for c in fake.calls if c[0] == "submit_review_approve"]) == 1
     assert store.read_ledger("owner/repo", 66) == []
+
+
+# --- CHG-1105 tick hook + rule-coverage command -----------------------------
+
+
+SAMPLE_BODY_67 = """## Test plan
+
+- [ ] CI ubuntu-latest passes (no code touched, but workflow may run)
+- [ ] CI macos-latest passes
+- [ ] Codex GitHub bot review
+"""
+
+
+def test_tick_writes_one_box_miss_per_skipped_classification(
+    store: StateStore, monkeypatch, ready_poll: PollRecord
+) -> None:
+    """Replay PR-#67 round-1 conditions: empty CI + status=PENDING (not trusted)
+    yields 2 skipped CI boxes + 1 flipped Codex box → 2 misses written."""
+    from tests.conftest import FakeGhClient
+    poll = ready_poll.model_copy(update={
+        "repo": "owner/repo", "pr": 66, "ci": {},
+        "status": __import__("swm.models", fromlist=["Status"]).Status.PENDING,
+        "codex_pr_body_signal": "approved",
+    })
+    store.append_poll(poll)
+    fake = FakeGhClient(
+        prs=[{"number": 66, "headRefOid": poll.head_sha, "author": {"login": "ryosaeba1985"}}],
+        active_login="frankyxhl",
+        pr_bodies={66: SAMPLE_BODY_67},
+    )
+    monkeypatch.setattr("swm.cli.GhClient", lambda: fake)
+    result = runner.invoke(app, [
+        "tick", "owner/repo", "66",
+        "--reason", "TDD test",
+        "--yes",
+        "--state-dir", str(store.directory),
+    ])
+    assert result.exit_code == 0, result.stdout
+    misses = list(store.read_box_misses("owner/repo"))
+    assert len(misses) == 2
+    assert {m.box_text for m in misses} == {
+        "CI ubuntu-latest passes (no code touched, but workflow may run)",
+        "CI macos-latest passes",
+    }
+    # Both misses must have rule_id set (predicate-refused, not coverage-gap)
+    assert all(m.rule_id in {"ci.ubuntu", "ci.macos"} for m in misses)
+
+
+def test_tick_writes_no_box_misses_when_every_box_flips(
+    store: StateStore, monkeypatch, ready_poll: PollRecord
+) -> None:
+    """Happy negative — when every box satisfies a rule, no misses recorded."""
+    from tests.conftest import FakeGhClient
+    poll = ready_poll.model_copy(update={"repo": "owner/repo", "pr": 70, "codex_pr_body_signal": "approved"})
+    store.append_poll(poll)
+    fake = FakeGhClient(
+        prs=[{"number": 70, "headRefOid": poll.head_sha, "author": {"login": "ryosaeba1985"}}],
+        active_login="frankyxhl",
+        pr_bodies={70: "- [ ] CI ubuntu-latest passes\n- [ ] Codex GitHub bot review\n"},
+    )
+    monkeypatch.setattr("swm.cli.GhClient", lambda: fake)
+    result = runner.invoke(app, [
+        "tick", "owner/repo", "70",
+        "--reason", "TDD test",
+        "--yes",
+        "--state-dir", str(store.directory),
+    ])
+    assert result.exit_code == 0, result.stdout
+    assert list(store.read_box_misses("owner/repo")) == []
+
+
+def test_tick_writes_box_miss_for_unmatched_rule(
+    store: StateStore, monkeypatch, ready_poll: PollRecord
+) -> None:
+    """Coverage-gap branch: 'CHANGELOG updated' has no BOX_RULES regex.
+    The miss is recorded with rule_id=None."""
+    from tests.conftest import FakeGhClient
+    poll = ready_poll.model_copy(update={"repo": "owner/repo", "pr": 71})
+    store.append_poll(poll)
+    fake = FakeGhClient(
+        prs=[{"number": 71, "headRefOid": poll.head_sha, "author": {"login": "ryosaeba1985"}}],
+        active_login="frankyxhl",
+        pr_bodies={71: "- [ ] CHANGELOG updated\n- [ ] Manual smoke test\n"},
+    )
+    monkeypatch.setattr("swm.cli.GhClient", lambda: fake)
+    result = runner.invoke(app, [
+        "tick", "owner/repo", "71",
+        "--reason", "TDD test",
+        "--yes",
+        "--state-dir", str(store.directory),
+    ])
+    misses = list(store.read_box_misses("owner/repo"))
+    assert len(misses) == 2
+    assert all(m.rule_id is None for m in misses)
+    texts = {m.box_text for m in misses}
+    assert "CHANGELOG updated" in texts
+    assert "Manual smoke test" in texts
+
+
+def test_tick_writes_misses_even_when_user_aborts_confirm(
+    store: StateStore, monkeypatch, ready_poll: PollRecord
+) -> None:
+    """Misses are observations of what the classifier saw, recorded regardless
+    of whether the user confirms the flip. Run with input=N to abort confirm."""
+    from tests.conftest import FakeGhClient
+    poll = ready_poll.model_copy(update={"repo": "owner/repo", "pr": 72, "codex_pr_body_signal": "approved"})
+    store.append_poll(poll)
+    fake = FakeGhClient(
+        prs=[{"number": 72, "headRefOid": poll.head_sha, "author": {"login": "ryosaeba1985"}}],
+        active_login="frankyxhl",
+        pr_bodies={72: "- [ ] Codex GitHub bot review\n- [ ] Manual smoke test\n"},
+    )
+    monkeypatch.setattr("swm.cli.GhClient", lambda: fake)
+    result = runner.invoke(app, [
+        "tick", "owner/repo", "72",
+        "--reason", "TDD test",
+        "--state-dir", str(store.directory),
+    ], input="n\n")
+    # Exit code should be 1 (aborted) but the miss for "Manual smoke test" must still be recorded
+    misses = list(store.read_box_misses("owner/repo"))
+    assert any(m.box_text == "Manual smoke test" for m in misses)
+
+
+def _seed_misses(store: StateStore, repo: str, pr: int, *,
+                 box_text: str, count: int, rule_id: str | None,
+                 ts_offset_days: int = 0) -> None:
+    """Helper: write `count` BoxMiss rows for one box_text/rule combo, ts now-offset."""
+    from datetime import datetime, timezone, timedelta
+    from swm.models import BoxMiss
+    base_ts = datetime.now(timezone.utc).replace(microsecond=0) - timedelta(days=ts_offset_days)
+    for _ in range(count):
+        store.append_box_miss(BoxMiss(
+            ts=base_ts, repo=repo, pr=pr, head_sha="x" * 40,
+            box_text=box_text, rule_id=rule_id, satisfied=False, reason="seeded",
+        ))
+
+
+def test_rule_coverage_groups_by_canonical_text(store: StateStore) -> None:
+    """count column = number of misses grouped under the canonical (lowercased + ws-collapsed) form."""
+    _seed_misses(store, "owner/repo", 1, box_text="CI ubuntu-latest passes", count=3, rule_id="ci.ubuntu")
+    _seed_misses(store, "owner/repo", 2, box_text="ci  ubuntu-latest  passes", count=2, rule_id="ci.ubuntu")  # whitespace variant — same canonical
+    result = runner.invoke(app, [
+        "rule-coverage", "owner/repo",
+        "--threshold", "1",
+        "--state-dir", str(store.directory),
+    ], env={"COLUMNS": "200"})
+    assert result.exit_code == 0, result.stdout
+    # Both variants canonicalize to the same text → one row, count=5
+    assert "5" in result.stdout
+    assert "ci ubuntu-latest passes" in result.stdout.lower()
+
+
+def test_rule_coverage_filters_by_threshold(store: StateStore) -> None:
+    """Default --threshold 3 hides count<3 rows."""
+    _seed_misses(store, "owner/repo", 1, box_text="One-off", count=1, rule_id=None)
+    _seed_misses(store, "owner/repo", 2, box_text="Recurring", count=4, rule_id=None)
+    result = runner.invoke(app, [
+        "rule-coverage", "owner/repo",
+        "--state-dir", str(store.directory),
+    ], env={"COLUMNS": "200"})
+    assert result.exit_code == 0, result.stdout
+    assert "Recurring".lower() in result.stdout.lower()
+    assert "One-off".lower() not in result.stdout.lower()
+
+
+def test_rule_coverage_filters_by_since_window(store: StateStore) -> None:
+    """Default --since 7d filters out misses older than 7 days."""
+    _seed_misses(store, "owner/repo", 1, box_text="Old miss", count=4, rule_id=None, ts_offset_days=14)
+    _seed_misses(store, "owner/repo", 2, box_text="Recent miss", count=4, rule_id=None, ts_offset_days=1)
+    result = runner.invoke(app, [
+        "rule-coverage", "owner/repo",
+        "--state-dir", str(store.directory),
+    ], env={"COLUMNS": "200"})
+    assert result.exit_code == 0, result.stdout
+    assert "Recent miss".lower() in result.stdout.lower()
+    assert "Old miss".lower() not in result.stdout.lower()
+
+
+def test_rule_coverage_distinguishes_predicate_refused_vs_coverage_gap(
+    store: StateStore,
+) -> None:
+    """matched_rule column shows the rule_id for predicate-refused misses,
+    or '—' for coverage-gap (no rule matched at all)."""
+    _seed_misses(store, "owner/repo", 1, box_text="CI ubuntu-latest passes", count=3, rule_id="ci.ubuntu")
+    _seed_misses(store, "owner/repo", 2, box_text="CHANGELOG updated", count=3, rule_id=None)
+    result = runner.invoke(app, [
+        "rule-coverage", "owner/repo",
+        "--state-dir", str(store.directory),
+    ], env={"COLUMNS": "200"})
+    assert result.exit_code == 0, result.stdout
+    assert "ci.ubuntu" in result.stdout
+    assert "—" in result.stdout  # coverage-gap marker for the CHANGELOG row
+
+
+def test_rule_coverage_exits_clean_when_no_misses(store: StateStore) -> None:
+    """Empty state → friendly message, exit 0."""
+    result = runner.invoke(app, [
+        "rule-coverage", "never/ran",
+        "--state-dir", str(store.directory),
+    ])
+    assert result.exit_code == 0
+    assert "no box misses" in result.stdout.lower()
+
+
+def test_rule_coverage_canonicalization_keeps_distinct_runner_versions_separate(
+    store: StateStore,
+) -> None:
+    """CHG-1105 Compatibility note: 'CI ubuntu' and 'CI ubuntu-latest' canonicalize
+    differently and appear as separate rows. Maintainer decides whether they
+    should share a rule. SWM-1106's regex-design step is where that judgement happens."""
+    _seed_misses(store, "owner/repo", 1, box_text="CI ubuntu passes", count=3, rule_id="ci.ubuntu")
+    _seed_misses(store, "owner/repo", 2, box_text="CI ubuntu-latest passes", count=3, rule_id="ci.ubuntu")
+    result = runner.invoke(app, [
+        "rule-coverage", "owner/repo",
+        "--state-dir", str(store.directory),
+    ], env={"COLUMNS": "200"})
+    assert result.exit_code == 0, result.stdout
+    # Two distinct rows, each count=3
+    assert result.stdout.count("3") >= 2
+    assert "ci ubuntu passes" in result.stdout.lower()
+    assert "ci ubuntu-latest passes" in result.stdout.lower()

@@ -22,7 +22,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Iterator
 
-from .models import LedgerEntry, PollRecord, ThreadSnapshot
+from .models import BoxMiss, LedgerEntry, PollRecord, ThreadSnapshot
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_STATE_DIR = REPO_ROOT / "state"
@@ -64,6 +64,9 @@ class StateStore:
 
     def _ledger_path(self, repo: str, pr: int) -> Path:
         return self._pr_dir(repo, pr) / "ledger.jsonl"
+
+    def _box_misses_path(self, repo: str, pr: int) -> Path:
+        return self._pr_dir(repo, pr) / "box-misses.jsonl"
 
     # --- polls ---------------------------------------------------------------
 
@@ -154,6 +157,33 @@ class StateStore:
             LedgerEntry.model_validate_json(line)
             for line in _read_jsonl(self._ledger_path(repo, pr))
         ]
+
+    # --- box misses (CHG-1105 classifier blind-spot visibility) -------------
+
+    def append_box_miss(self, miss: BoxMiss) -> None:
+        """Append one observation of a skipped box. Append-only — the file is
+        the audit trail of classifier blind spots."""
+        path = self._box_misses_path(miss.repo, miss.pr)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("a") as f:
+            f.write(miss.model_dump_json() + "\n")
+
+    def read_box_misses(self, repo: str | None = None) -> Iterator[BoxMiss]:
+        """Walk every box-misses.jsonl matching the optional repo filter."""
+        for path in self._iter_box_misses_paths(repo):
+            for line in _read_jsonl(path):
+                yield BoxMiss.model_validate_json(line)
+
+    def _iter_box_misses_paths(self, repo: str | None) -> Iterator[Path]:
+        if not self.directory.exists():
+            return
+        if repo is not None:
+            owner, name = repo.split("/", 1)
+            base = self.directory / owner / name
+            if base.exists():
+                yield from sorted(base.glob("pr-*/box-misses.jsonl"))
+            return
+        yield from sorted(self.directory.glob("*/*/pr-*/box-misses.jsonl"))
 
 
 def default_store() -> StateStore:

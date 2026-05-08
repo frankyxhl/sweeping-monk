@@ -16,7 +16,7 @@ from datetime import datetime
 from typing import Callable
 
 from .gh import GhClient
-from .models import CIConclusion, LedgerEntry, PollRecord, Status
+from .models import BoxMiss, CIConclusion, LedgerEntry, PollRecord, Status
 from .state import StateStore, now_utc
 
 PREFERRED_AGENT_LOGIN = "ryosaeba1985"
@@ -266,6 +266,22 @@ def build_approve_ledger_entry(
             "codex_resolved": poll.codex_resolved,
         },
         result=review_result,
+    )
+
+
+def build_box_miss(
+    *, classification: BoxClassification, poll: PollRecord, ts: datetime | None = None,
+) -> BoxMiss:
+    """One observation of a skipped box. Caller persists via store.append_box_miss."""
+    return BoxMiss(
+        ts=ts or now_utc(),
+        repo=poll.repo,
+        pr=poll.pr,
+        head_sha=poll.head_sha,
+        box_text=classification.box.text,
+        rule_id=classification.rule_id,
+        satisfied=classification.satisfied,
+        reason=classification.reason,
     )
 
 

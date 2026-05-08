@@ -270,3 +270,54 @@ def test_classify_box_ci_both_empty_ci_with_ready_status_is_satisfied(ready_poll
     c = classify_box(a12_box, poll)
     assert c.rule_id == "ci.both"
     assert c.satisfied is True
+
+
+# --- CHG-1105 build_box_miss ------------------------------------------------
+
+
+def test_build_box_miss_records_unmatched_rule_branch(ready_poll):
+    """When rule_id is None (no BOX_RULES regex matched), box_miss carries that
+    truthfully so the rule-coverage report can flag a coverage gap."""
+    from swm.guarded import build_box_miss, BoxClassification, CheckboxLine
+    classification = BoxClassification(
+        box=CheckboxLine(raw="- [ ] CHANGELOG updated", text="CHANGELOG updated", line_number=12),
+        rule_id=None,
+        satisfied=False,
+        reason="no rule matched — manual check required",
+    )
+    miss = build_box_miss(classification=classification, poll=ready_poll)
+    assert miss.repo == ready_poll.repo
+    assert miss.pr == ready_poll.pr
+    assert miss.head_sha == ready_poll.head_sha
+    assert miss.box_text == "CHANGELOG updated"
+    assert miss.rule_id is None
+    assert miss.satisfied is False
+    assert "no rule matched" in miss.reason
+
+
+def test_build_box_miss_records_predicate_refused_branch(pending_poll):
+    """When a rule matched but its predicate said not satisfied, both rule_id
+    and the refusal reason are preserved — enables count-by-rule analysis."""
+    from swm.guarded import build_box_miss, BoxClassification, CheckboxLine
+    poll = pending_poll.model_copy(update={"ci": {}})
+    classification = BoxClassification(
+        box=CheckboxLine(raw="- [ ] CI ubuntu-latest passes", text="CI ubuntu-latest passes", line_number=5),
+        rule_id="ci.ubuntu",
+        satisfied=False,
+        reason="no CI runs and parent verdict=pending (not yet trusted)",
+    )
+    miss = build_box_miss(classification=classification, poll=poll)
+    assert miss.rule_id == "ci.ubuntu"
+    assert miss.satisfied is False
+    assert "not yet trusted" in miss.reason
+
+
+def test_build_box_miss_uses_now_utc_when_ts_omitted(ready_poll):
+    """Default ts must be a tz-aware UTC datetime — so since-window filters work."""
+    from swm.guarded import build_box_miss, BoxClassification, CheckboxLine
+    classification = BoxClassification(
+        box=CheckboxLine(raw="- [ ] x", text="x", line_number=1),
+        rule_id=None, satisfied=False, reason="r",
+    )
+    miss = build_box_miss(classification=classification, poll=ready_poll)
+    assert miss.ts.tzinfo is not None  # tz-aware

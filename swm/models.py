@@ -139,6 +139,27 @@ class GitHubThreadState(BaseModel):
     synced_at: datetime | None = None
 
 
+class BoxMiss(BaseModel):
+    """One skipped-box observation from `swm tick`. Append-only.
+
+    Distinct from LedgerEntry: misses are observations of what the classifier
+    saw, not authorized actions. No actor, no authorization, no result — just
+    the box text + the rule's verdict + a reason. Feeds the `swm rule-coverage`
+    report (CHG-1105) so blind spots become visible without the maintainer
+    having to push back on every PR.
+    """
+    model_config = ConfigDict(extra="allow")
+
+    ts: datetime
+    repo: str
+    pr: int
+    head_sha: str
+    box_text: str
+    rule_id: str | None = None
+    satisfied: bool = False
+    reason: str
+
+
 class LedgerAction(str, Enum):
     SUBMIT_REVIEW_APPROVE = "submit_review_approve"
     EDIT_PR_BODY_CHECK_BOXES = "edit_pr_body_check_boxes"
