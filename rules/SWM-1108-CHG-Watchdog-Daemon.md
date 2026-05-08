@@ -20,7 +20,7 @@ Three new pieces:
 
 | Piece | Surface | What it does |
 |-------|---------|--------------|
-| **`swm-watchd`** | console_script → `swm/daemon.py:main` | Long-running. Loops over configured PRs at cadence; for each, runs `swm watch --quiet` (CHG-1107). On `exit 1` (state changed), passes the JSON delta to Sonnet via SDK with the right tool surface; on `exit 0` (no change), continues. On Sonnet's tool_use response, executes (e.g. writes an inbox event); on text response, writes to a notification log. |
+| **`swm-watchd`** | console_script → `swm/daemon.py:main` | Long-running. Loops over configured PRs at cadence; for each, runs `swm poll <repo>` (with CHG-1107's SWM-1100 §3 short-circuit). When stdout starts with `no change:`, continues silently — no SDK call. Otherwise, passes the dashboard output to Sonnet via SDK with the right tool surface; on Sonnet's tool_use response, executes (e.g. writes an inbox event); on text response, writes to a notification log. |
 | **`swm inbox` CLI family** | `swm/cli.py` | `swm inbox` (list pending), `swm inbox view <id>`, `swm inbox approve <id> [--reason]`, `swm inbox deny <id> [--reason]`, `swm inbox snooze <id> --until 1h`. Joins `inbox.jsonl` (events from daemon) with `inbox-decisions.jsonl` (your y/n records) to compute pending events. `approve` reuses the existing `swm approve` SWM-1103 gate stack — no new authorization surface. |
 | **Daemon config** | `~/.config/swm/watchd.toml` | Lists watched PRs + per-PR scope (read-only / standing-auth / merge-allowed) + Sonnet model id + cadence. Authoritative source of who's being monitored. |
 
@@ -101,4 +101,4 @@ The interaction model (your B vote): events flow into `inbox.jsonl`; you run `sw
 
 | Date | Change | By |
 |------|--------|----|
-| 2026-05-08 | Initial proposal — replace cron+Opus monitoring with a Sonnet-driven local daemon + `swm inbox` CLI for maintainer authorization. Depends on CHG-1107 (`swm watch --quiet`) for the routine-polling cheap path. | Claude Code |
+| 2026-05-08 | Initial proposal — replace cron+Opus monitoring with a Sonnet-driven local daemon + `swm inbox` CLI for maintainer authorization. Depends on CHG-1107 (SWM-1100 §3 short-circuit in `swm poll`) for the routine-polling cheap path. | Claude Code |
