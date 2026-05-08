@@ -233,3 +233,40 @@ def test_build_tick_ledger_entry_records_each_box(ready_poll):
     assert entry.action == LedgerAction.EDIT_PR_BODY_CHECK_BOXES
     assert entry.evidence["boxes_flipped"][0]["rule"] == "ci.ubuntu"
     assert entry.result["diff_lines_changed"] == 1
+
+
+# --- docs-only / paths-ignore CI handling (round-2 fix) ---------------------
+
+
+def test_classify_box_ci_runner_empty_ci_with_ready_status_is_satisfied(ready_poll):
+    """When CI dict is empty AND parent verdict already trusts it (status=ready),
+    treat 'CI ubuntu-latest passes' as satisfied — paths-ignore / docs-only case."""
+    poll = ready_poll.model_copy(update={"ci": {}})
+    boxes = parse_unchecked_boxes(SAMPLE_BODY)
+    ubuntu_box = next(b for b in boxes if b.text.startswith("CI ubuntu-latest passes"))
+    c = classify_box(ubuntu_box, poll)
+    assert c.rule_id == "ci.ubuntu"
+    assert c.satisfied is True
+    assert "paths-ignore" in c.reason
+
+
+def test_classify_box_ci_runner_empty_ci_with_pending_status_not_satisfied(pending_poll):
+    """When CI dict is empty BUT parent verdict isn't yet ready (still in grace
+    window, or transient), do NOT trust the empty-CI state."""
+    poll = pending_poll.model_copy(update={"ci": {}})
+    boxes = parse_unchecked_boxes(SAMPLE_BODY)
+    ubuntu_box = next(b for b in boxes if b.text.startswith("CI ubuntu-latest passes"))
+    c = classify_box(ubuntu_box, poll)
+    assert c.rule_id == "ci.ubuntu"
+    assert c.satisfied is False
+    assert "not yet trusted" in c.reason
+
+
+def test_classify_box_ci_both_empty_ci_with_ready_status_is_satisfied(ready_poll):
+    """Same trust transfer applies to the 'CI ubuntu+macos' combined rule."""
+    poll = ready_poll.model_copy(update={"ci": {}})
+    boxes = parse_unchecked_boxes(SAMPLE_BODY)
+    a12_box = next(b for b in boxes if "A12" in b.text)
+    c = classify_box(a12_box, poll)
+    assert c.rule_id == "ci.both"
+    assert c.satisfied is True

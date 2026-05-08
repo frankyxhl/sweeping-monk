@@ -168,8 +168,24 @@ Predicate = Callable[[PollRecord], tuple[bool, str]]
 
 
 def _ci_runner_predicate(needle: str) -> Predicate:
-    """Match any CI key whose name contains `needle` (case-insensitive). All matches must be SUCCESS."""
+    """Match any CI key whose name contains `needle` (case-insensitive).
+
+    Three branches:
+    - poll.ci has matching runner(s) all SUCCESS → satisfied.
+    - poll.ci has matching runner(s) but not all green → not satisfied.
+    - poll.ci is empty AND poll.status == READY → satisfied (paths-ignore /
+      docs-only PR; the parent verdict has already trusted the empty-CI state
+      after the CI grace window in poll.py). This trust transfer is the only
+      way an unsatisfiable predicate becomes satisfied — if status is anything
+      other than READY, an empty CI dict is still treated as unverified.
+    - poll.ci is non-empty but no runner matches → not satisfied (the runner
+      that should have fired didn't — suspicious, leave to maintainer).
+    """
     def _check(poll: PollRecord) -> tuple[bool, str]:
+        if not poll.ci:
+            if poll.status == Status.READY:
+                return True, f"no CI runs (paths-ignore / docs-only); parent verdict=ready"
+            return False, f"no CI runs and parent verdict={poll.status.value} (not yet trusted)"
         matches = [(k, v) for k, v in poll.ci.items() if needle.lower() in k.lower()]
         if not matches:
             return False, f"no CI runner matching {needle!r}"
@@ -182,7 +198,9 @@ def _ci_runner_predicate(needle: str) -> Predicate:
 
 def _all_ci_green(poll: PollRecord) -> tuple[bool, str]:
     if not poll.ci:
-        return False, "no CI runs reported"
+        if poll.status == Status.READY:
+            return True, "no CI runs (paths-ignore / docs-only); parent verdict=ready"
+        return False, f"no CI runs and parent verdict={poll.status.value} (not yet trusted)"
     bad = [k for k, v in poll.ci.items() if v != CIConclusion.SUCCESS]
     if bad:
         return False, f"non-green runners: {', '.join(bad)}"
