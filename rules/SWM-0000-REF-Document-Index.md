@@ -18,6 +18,8 @@
 | 1106 | SOP | Rule Addition Cycle |
 | 1107 | CHG | Watch Quiet Mode |
 | 1108 | CHG | Watchdog Daemon |
+| 1109 | SOP | Codex Re Review Trigger |
+| 1110 | CHG | Codex Re Review Trigger Implementation |
 
 ---
 

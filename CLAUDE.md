@@ -23,16 +23,17 @@ Read these on session start with `af read SWM-1100`, `af read SWM-1101`, `af rea
 
 ## Stage 1.5 Permission Model (Active as of 2026-05-07)
 
-Stage 1.5 narrowly extends Stage 1 with **one** write action: synchronizing the watchdog's local `RESOLVED` verdict to GitHub's review-thread state.
+Stage 1.5 narrowly extends Stage 1 with two write actions: synchronizing the watchdog's local `RESOLVED` verdict to GitHub's review-thread state, and triggering Codex re-review when Codex has not reviewed the current head.
 
 Additionally allowed (beyond Stage 1):
 
 - Call `gh api graphql` with the `resolveReviewThread` mutation **only** for threads where the watchdog's local verdict is `RESOLVED` per SWM-1101.
 - Call `gh api graphql` with the `unresolveReviewThread` mutation **only** to undo a prior `resolveReviewThread` made by the watchdog (used when a later poll downgrades the verdict back to `OPEN`, e.g., new commits introduce a regression).
+- Call `gh api repos/<o>/<r>/issues/<N>/comments --method POST -f body="@codex review"` **only** when: (a) Codex has at least one prior review on this PR, (b) the latest Codex review's `commit.oid` ≠ current `head_sha`, (c) Codex's PR-body signal is not 👀, and (d) `PollRecord.codex_rereview_triggered` is `false` for this `head_sha`. Governed by SWM-1109. One trigger per `(PR, head_sha)`, no other comment text permitted.
 
 Still forbidden in Stage 1.5 (write actions reserved for Stage 2+):
 
-- Posting any comment, review, or message to GitHub.
+- Posting any comment other than `@codex review` under the SWM-1109 conditions above.
 - Submitting `APPROVE`, `REQUEST_CHANGES`, or `COMMENT` reviews.
 - Editing the PR title, body, labels, assignees, or milestone.
 - Merging PRs, enabling auto-merge, changing branch protection or CODEOWNERS.
@@ -78,9 +79,10 @@ The maintainer may gradually unlock more permissions later:
 
 ```text
 Stage 1:   read-only local watchdog
-Stage 1.5: read + resolveReviewThread sync (active 2026-05-07) — only for threads
-           the watchdog has locally judged RESOLVED per SWM-1101. No new comments,
-           no reviews, no merges.
+Stage 1.5: read + resolveReviewThread sync + @codex review trigger (active 2026-05-07).
+           No general comments, no reviews, no merges. Write actions are narrowly
+           scoped: resolve/unresolve threads per SWM-1101; post "@codex review"
+           once per (PR, head_sha) per SWM-1109.
 Stage 2:   local watchdog posts non-blocking comments
 Stage 3:   machine user submits COMMENT / APPROVE / REQUEST_CHANGES
 Stage 4:   GitHub CODEOWNERS + required code owner review
@@ -302,7 +304,7 @@ Do not use write commands in Stage 1, including:
 ```bash
 gh pr review
 gh pr merge
-gh api --method POST
+gh api --method POST   # except @codex review trigger in Stage 1.5 per SWM-1109
 gh api --method PATCH
 gh api --method PUT
 gh api --method DELETE
@@ -315,7 +317,7 @@ Do not:
 - Create a bot account.
 - Request new GitHub permissions.
 - Submit GitHub reviews.
-- Post GitHub comments.
+- Post GitHub comments, except the single `@codex review` trigger in Stage 1.5 per SWM-1109.
 - Merge PRs.
 - Enable auto-merge.
 - Create synthetic required status checks.
