@@ -753,3 +753,60 @@ def test_rule_coverage_rejects_malformed_repo_argument(tmp_path) -> None:
     if result.exception is not None:
         from click.exceptions import BadParameter
         assert isinstance(result.exception, (BadParameter, SystemExit))
+
+
+# --- CHG-1107: poll short-circuit CLI render tests -------------------------
+
+
+def _ready_pr_49() -> dict:
+    """A steady-state ready PR for CHG-1107 CLI tests."""
+    return {
+        "number": 49, "title": "demo", "headRefOid": "deadbeef" + "0" * 32,
+        "baseRefName": "main", "isDraft": False, "mergeStateStatus": "CLEAN",
+        "statusCheckRollup": [{"name": "ci", "conclusion": "SUCCESS"}],
+        "updatedAt": "2026-05-07T12:00:00Z",
+    }
+
+
+def test_poll_command_renders_full_card_on_first_observation(
+    store: StateStore, monkeypatch,
+) -> None:
+    """CHG-1107 Test D: first observation must render the full dashboard card,
+    NOT the short-circuit 'no change:' line."""
+    from tests.conftest import FakeGhClient
+    fake = FakeGhClient(prs=[_ready_pr_49()])
+    monkeypatch.setattr("swm.cli.GhClient", lambda: fake)
+
+    result = runner.invoke(app, ["poll", "owner/repo", "--state-dir", str(store.directory)])
+
+    assert result.exit_code == 0
+    # Dashboard card rendered (has Rich border characters)
+    assert "╭" in result.stdout
+    # Short-circuit line must NOT be present
+    assert "no change:" not in result.stdout
+
+
+def test_poll_command_emits_short_circuit_line_when_state_unchanged(
+    store: StateStore, monkeypatch,
+) -> None:
+    """CHG-1107 Test C: second poll with same state emits one-line
+    'no change: <repo>#<pr> still <status> @ <short_sha> · codex_open=<k>'
+    instead of the full dashboard card. Exit code still 0."""
+    from tests.conftest import FakeGhClient
+    fake = FakeGhClient(prs=[_ready_pr_49()])
+    monkeypatch.setattr("swm.cli.GhClient", lambda: fake)
+
+    # First invocation — full card
+    result1 = runner.invoke(app, ["poll", "owner/repo", "--state-dir", str(store.directory)])
+    assert result1.exit_code == 0
+    assert "╭" in result1.stdout
+    assert "no change:" not in result1.stdout
+
+    # Second invocation — short-circuit line
+    result2 = runner.invoke(app, ["poll", "owner/repo", "--state-dir", str(store.directory)])
+    assert result2.exit_code == 0
+    # Must contain the short-circuit line
+    assert "no change: owner/repo#49 still ready @ " in result2.stdout
+    assert "codex_open=0" in result2.stdout
+    # Dashboard Rich border characters must be absent
+    assert "╭" not in result2.stdout

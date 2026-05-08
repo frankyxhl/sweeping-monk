@@ -116,7 +116,14 @@ def poll_cmd(
         console.print(f"[yellow]no open PRs in {repo} (base={base})[/yellow]")
         return
     for outcome in outcomes:
-        console.print(dashboard.pr_card(outcome.record, outcome.snapshots[0] if outcome.snapshots else None))
+        if outcome.is_no_change:
+            r = outcome.record
+            console.print(
+                f"no change: {r.repo}#{r.pr} still {r.status.value} "
+                f"@ {r.head_sha[:8]} · codex_open={r.codex_open}"
+            )
+        else:
+            console.print(dashboard.pr_card(outcome.record, outcome.snapshots[0] if outcome.snapshots else None))
     if any(o.sync_actions for o in outcomes):
         synced = sum(len(o.sync_actions) for o in outcomes)
         console.print(f"[green]Stage 1.5 sync: resolved {synced} thread(s) on GitHub[/green]")

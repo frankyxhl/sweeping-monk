@@ -345,6 +345,86 @@ def test_poll_pending_when_ci_in_progress(store: StateStore) -> None:
     assert outcomes[0].record.status is Status.PENDING
 
 
+# --- CHG-1107: poll short-circuit (state_key comparison) -------------------
+
+
+def test_poll_appends_new_record_even_when_state_unchanged(store: StateStore) -> None:
+    """CHG-1107 Test A: second poll with same state_key still appends to JSONL
+    (audit trail unbroken), and sets is_no_change=True on the second outcome."""
+    # Arrange — one ready PR with green CI, no codex threads
+    gh = FakeGhClient(prs=[_pr_summary(ci=[{"name": "ci", "conclusion": "SUCCESS"}])])
+
+    # Act — first poll
+    outcomes1 = poll("owner/repo", store=store, gh_client=gh)
+    # Act — second poll (same gh client → same state)
+    outcomes2 = poll("owner/repo", store=store, gh_client=gh)
+
+    # Assert — two records persisted (append-only, never skip)
+    persisted = list(store.read_polls())
+    assert len(persisted) == 2
+
+    # First observation: is_no_change is False (no prior to compare against)
+    assert outcomes1[0].is_no_change is False
+    # Second observation: same state_key → is_no_change is True
+    assert outcomes2[0].is_no_change is True
+
+
+@pytest.mark.parametrize("label,second_prs,second_threads", [
+    (
+        "head_sha_changed",
+        [_pr_summary(head="def456", ci=[{"name": "ci", "conclusion": "SUCCESS"}])],
+        None,
+    ),
+    (
+        "ci_changed",
+        [_pr_summary(head="abc123", ci=[{"name": "ci", "conclusion": "FAILURE"}])],
+        None,
+    ),
+    (
+        "codex_open_changed",
+        [_pr_summary(head="abc123", ci=[{"name": "ci", "conclusion": "SUCCESS"}])],
+        {49: [_codex_thread(body="**P3** style nit")]},
+    ),
+    (
+        "status_changed",
+        # CI in_progress → status goes from READY to PENDING
+        [_pr_summary(head="abc123", ci=[{"name": "ci", "conclusion": "IN_PROGRESS"}])],
+        None,
+    ),
+])
+def test_poll_marks_no_change_only_when_state_key_matches(
+    store: StateStore, label, second_prs, second_threads,
+) -> None:
+    """CHG-1107 Test B (parametrized): when any dimension of state_key changes,
+    the second poll must have is_no_change=False. Plus one non-parametrized
+    case where everything stays the same → is_no_change=True."""
+    # First poll — ready PR with green CI, no threads
+    gh1 = FakeGhClient(prs=[_pr_summary(ci=[{"name": "ci", "conclusion": "SUCCESS"}])])
+    outcomes1 = poll("owner/repo", store=store, gh_client=gh1)
+    assert outcomes1[0].is_no_change is False
+
+    # Second poll — state_key changes in one dimension
+    gh2_kwargs = {"prs": second_prs}
+    if second_threads is not None:
+        gh2_kwargs["review_threads"] = second_threads
+    gh2 = FakeGhClient(**gh2_kwargs)
+    outcomes2 = poll("owner/repo", store=store, gh_client=gh2)
+
+    # State changed → must NOT be marked as no-change
+    assert outcomes2[0].is_no_change is False
+
+
+def test_poll_no_change_true_when_state_key_identical(store: StateStore) -> None:
+    """CHG-1107 Test B companion: when state_key is identical, is_no_change=True."""
+    gh = FakeGhClient(prs=[_pr_summary(ci=[{"name": "ci", "conclusion": "SUCCESS"}])])
+    poll("owner/repo", store=store, gh_client=gh)
+    outcomes2 = poll("owner/repo", store=store, gh_client=gh)
+    assert outcomes2[0].is_no_change is True
+
+
+# --- (original tests continue) ---
+
+
 def test_poll_writes_thread_snapshots_for_each_codex_thread(store: StateStore) -> None:
     # Arrange
     gh = FakeGhClient(

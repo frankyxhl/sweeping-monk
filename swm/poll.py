@@ -59,6 +59,7 @@ class PollOutcome:
     record: PollRecord
     snapshots: list[ThreadSnapshot]
     sync_actions: list[Stage15Action]
+    is_no_change: bool = False
 
 
 def _ci_dict(rollup: list[dict]) -> dict[str, CIConclusion]:
@@ -368,8 +369,15 @@ def poll(
                     "trigger": "poll-cycle+stage1.5-sync",
                 })
 
+        # CHG-1107: short-circuit — compare state_key with prior poll
+        prior = store.latest_poll(repo, record.pr)
+        no_change = prior is not None and prior.state_key() == record.state_key()
+
         store.append_poll(record)
         for snap in snapshots:
             store.write_thread(snap)
-        outcomes.append(PollOutcome(record=record, snapshots=snapshots, sync_actions=actions))
+        outcomes.append(PollOutcome(
+            record=record, snapshots=snapshots, sync_actions=actions,
+            is_no_change=no_change,
+        ))
     return outcomes
