@@ -339,11 +339,10 @@ def test_ledger_command_renders_table(store: StateStore, ready_poll: PollRecord)
     store.append_ledger(entry)
     result = runner.invoke(
         app, ["ledger", "owner/repo", "66", "--state-dir", str(store.directory)],
-        env={"COLUMNS": "200"},
+        env={"COLUMNS": "300"},
     )
     assert result.exit_code == 0
-    # Rich may truncate the action column; assert on a prefix that survives truncation
-    assert "submit_review_appro" in result.stdout
+    assert "submit_review_approve" in result.stdout
     assert "CI green" in result.stdout
 
 
