@@ -14,6 +14,8 @@
 | 1102 | REF | Severity Promotion Rules |
 | 1103 | SOP | Maintainer Authorized Writes |
 | 1104 | CHG | Guarded Writes Automation |
+| 1105 | CHG | Classifier Blind Spot Visibility |
+| 1106 | SOP | Rule Addition Cycle |
 
 ---
 
