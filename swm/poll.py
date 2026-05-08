@@ -156,6 +156,7 @@ def _process_thread(
         author_reply_body=(reply or {}).get("body"),
         code_changed=(state == "B"),
         codex_followup_body=(followup or {}).get("body"),
+        github_isResolved=bool(thread.get("isResolved")),
     )
 
     comment_id = classify.codex_comment_id(thread) or 0

@@ -105,3 +105,37 @@ def test_substantive_reply_helper_directly() -> None:
     assert judge.is_substantive_reply(short) is False
     assert judge.is_substantive_reply(long_without_id) is False
     assert judge.is_substantive_reply(None) is False
+
+
+def test_judge_github_isResolved_overrides_all_other_signals():
+    """When GitHub itself reports isResolved=true (manual UI resolve, or any
+    external sync), trust GitHub as the system of record and return RESOLVED
+    regardless of classification / replies / Codex follow-up state.
+
+    Regression: prior behavior left local verdict OPEN even after a manual
+    UI resolve, because the classifier never read github_isResolved as a
+    verdict input. Surfaced live: sweeping-monk#1 state.py:179 thread."""
+    from swm import judge as judge_mod
+    decision = judge_mod.judge(
+        classification="A",            # nothing else looks resolved
+        author_reply_body=None,
+        code_changed=False,
+        codex_followup_body=None,
+        github_isResolved=True,
+    )
+    assert decision.verdict.value == "RESOLVED"
+    assert "GitHub" in decision.reason or "isResolved" in decision.reason
+
+
+def test_judge_github_isResolved_false_does_not_change_existing_logic(open_thread):
+    """github_isResolved=False (the common case) must not perturb step 3-6 logic."""
+    from swm import judge as judge_mod
+    decision = judge_mod.judge(
+        classification="A",
+        author_reply_body=None,
+        code_changed=False,
+        codex_followup_body=None,
+        github_isResolved=False,
+    )
+    # State A with no other signals → OPEN per existing logic
+    assert decision.verdict.value == "OPEN"
