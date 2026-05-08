@@ -369,9 +369,16 @@ def poll(
                     "trigger": "poll-cycle+stage1.5-sync",
                 })
 
-        # CHG-1107: short-circuit — compare state_key with prior poll
+        # CHG-1107: short-circuit — compare state_key with prior poll.
+        # Codex P2 (3207007032): sync mutations are state changes too —
+        # if Stage 1.5 resolved threads on this run, the run is NOT no-change
+        # even when head/CI/codex_open/status are unchanged.
         prior = store.latest_poll(repo, record.pr)
-        no_change = prior is not None and prior.state_key() == record.state_key()
+        no_change = (
+            prior is not None
+            and prior.state_key() == record.state_key()
+            and not actions
+        )
 
         store.append_poll(record)
         for snap in snapshots:

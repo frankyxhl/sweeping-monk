@@ -442,3 +442,31 @@ def test_poll_writes_thread_snapshots_for_each_codex_thread(store: StateStore) -
     assert {snap.thread_id for snap in outcomes[0].snapshots} == {"T1", "T2"}
     assert store.read_thread("owner/repo", 49, "T1") is not None
     assert store.read_thread("owner/repo", 49, "T2") is not None
+
+
+def test_poll_outcome_is_changed_when_sync_actions_occur(store, monkeypatch, ready_poll):
+    """P2 fix (Codex finding 3207007032): sync mutations are state changes.
+    With --sync, a poll can resolve threads on GitHub even when state_key matches —
+    that's a real mutation and quiet-mode consumers must NOT treat it as no-change.
+    """
+    from tests.conftest import FakeGhClient
+    from swm.models import Stage15Action
+    prior = ready_poll.model_copy(update={"repo": "owner/repo", "pr": 49})
+    store.append_poll(prior)
+    # Build the SAME state_key in the next poll, but with a sync action present.
+    monkeypatch.setattr(
+        "swm.poll._maybe_sync",
+        lambda *a, **kw: [Stage15Action(mutation="resolveReviewThread", threadId="T_x", result={"isResolved": True})],
+    )
+    fake = FakeGhClient(prs=[{
+        "number": 49, "title": prior.title, "headRefOid": prior.head_sha,
+        "baseRefName": "main", "isDraft": False, "mergeStateStatus": prior.merge_state,
+        "statusCheckRollup": [{"name": k, "conclusion": v.value} for k, v in prior.ci.items()],
+        "updatedAt": "2026-05-08T00:00:00Z",
+    }])
+    outcomes = poll(prior.repo, store=store, gh_client=fake, sync=True, base="main")
+    assert len(outcomes) == 1
+    assert outcomes[0].sync_actions, "sync action must be present"
+    assert outcomes[0].is_no_change is False, (
+        "P2: sync mutation must mark outcome as changed, not no-change"
+    )

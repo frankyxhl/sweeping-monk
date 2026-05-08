@@ -810,3 +810,43 @@ def test_poll_command_emits_short_circuit_line_when_state_unchanged(
     assert "codex_open=0" in result2.stdout
     # Dashboard Rich border characters must be absent
     assert "╭" not in result2.stdout
+
+
+def test_poll_command_renders_full_cards_when_any_pr_changed_in_multi_pr_run(
+    store: StateStore, monkeypatch, ready_poll: PollRecord
+) -> None:
+    """P1 fix (Codex finding 3207007029): the `no change:` sentinel must represent
+    the entire poll run. If any PR in a multi-PR repo changed, the cron-grep
+    pattern `grep -q "^no change:" && exit 0` would otherwise lose the alert
+    for the changed PR. Rule: emit per-PR `no change:` lines only when EVERY
+    outcome in the run is unchanged.
+    """
+    from tests.conftest import FakeGhClient
+    repo = "owner/repo"
+    # Seed prior polls for two PRs at known state_keys.
+    poll_49 = ready_poll.model_copy(update={"repo": repo, "pr": 49, "head_sha": "stable49" + "0" * 32})
+    poll_50 = ready_poll.model_copy(update={"repo": repo, "pr": 50, "head_sha": "stable50" + "0" * 32})
+    store.append_poll(poll_49)
+    store.append_poll(poll_50)
+    # Next run: PR 49 unchanged, PR 50 head bumped (state_key changes).
+    fake = FakeGhClient(prs=[
+        {"number": 49, "title": poll_49.title, "headRefOid": poll_49.head_sha,
+         "baseRefName": "main", "isDraft": False, "mergeStateStatus": poll_49.merge_state,
+         "statusCheckRollup": [{"name": k, "conclusion": v.value} for k, v in poll_49.ci.items()],
+         "updatedAt": "2026-05-08T00:00:00Z"},
+        {"number": 50, "title": poll_50.title, "headRefOid": "newhead50" + "0" * 31,  # bumped
+         "baseRefName": "main", "isDraft": False, "mergeStateStatus": poll_50.merge_state,
+         "statusCheckRollup": [{"name": k, "conclusion": v.value} for k, v in poll_50.ci.items()],
+         "updatedAt": "2026-05-08T01:00:00Z"},
+    ])
+    monkeypatch.setattr("swm.cli.GhClient", lambda: fake)
+    result = runner.invoke(app, ["poll", repo, "--state-dir", str(store.directory)])
+    assert result.exit_code == 0, result.stdout
+    # Cron-correctness invariant: ANY PR changed → no `no change:` line at line-start
+    assert "no change:" not in result.stdout, (
+        f"P1: mixed run must NOT emit 'no change:' lines (cron grep would suppress changed PR). "
+        f"Got:\n{result.stdout}"
+    )
+    # Both PRs surface (full cards rendered)
+    assert "#49" in result.stdout
+    assert "#50" in result.stdout
