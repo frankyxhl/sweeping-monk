@@ -115,6 +115,18 @@ def poll_cmd(
     if not outcomes:
         console.print(f"[yellow]no open PRs in {repo} (base={base})[/yellow]")
         return
+    # Codex P1 (3207007029): the `no change:` sentinel represents the WHOLE run.
+    # If any PR in a multi-PR repo changed, the cron pattern `grep -q "^no change:"
+    # && exit 0` would otherwise suppress the changed PR. Emit per-PR no-change
+    # lines only when every outcome is unchanged.
+    if all(o.is_no_change for o in outcomes):
+        for outcome in outcomes:
+            r = outcome.record
+            console.print(
+                f"no change: {r.repo}#{r.pr} still {r.status.value} "
+                f"@ {r.head_sha[:8]} · codex_open={r.codex_open}"
+            )
+        return
     for outcome in outcomes:
         console.print(dashboard.pr_card(outcome.record, outcome.snapshots[0] if outcome.snapshots else None))
     if any(o.sync_actions for o in outcomes):

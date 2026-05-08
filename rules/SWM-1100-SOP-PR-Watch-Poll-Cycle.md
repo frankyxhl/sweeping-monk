@@ -65,16 +65,19 @@ gh api repos/<owner>/<repo>/issues/<N>/comments
 
 ### 3. Compute the poll state key
 
-`state_key = (pr_number, head_sha, ci_status_summary, codex_open_threads_count)`
+`state_key = (pr_number, head_sha, ci_status_summary, codex_open_threads_count, status)`
 
 Where:
 - `ci_status_summary` = ordered tuple of (`check_name`, `conclusion`) from `statusCheckRollup`.
 - `codex_open_threads_count` = number of unresolved Codex threads per SOP-1101.
+- `status` = the computed Status value (ready / blocked / pending / error / skipped).
+
+(Implemented in code as `PollRecord.state_key()` per CHG-1107.)
 
 If `state_key` matches the cached value from the previous poll for this PR, emit a single line and skip to step 7:
 
 ```text
-no change: PR #N still <status> @ <short_sha> · codex_open=<k>
+no change: <repo>#<pr> still <status> @ <short_sha> · codex_open=<k>
 ```
 
 ### 4. Re-evaluate when state changed (or first time)
@@ -142,4 +145,5 @@ Inherited from CLAUDE.md, repeated for emphasis:
 
 | Date | Change | By |
 |------|--------|----|
+| 2026-05-08 | CHG-1107: aligned §3 emit example with implementation (`<repo>#<pr>` prefix; 5-tuple `state_key` including `status`) | GLM-5.1 |
 | 2026-05-07 | Initial version — codify the 5-minute poll cycle including Codex thread re-evaluation | Claude Code |
