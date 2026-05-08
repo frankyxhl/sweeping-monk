@@ -70,11 +70,22 @@ def judge(
     author_reply_body: str | None,
     code_changed: bool,
     codex_followup_body: str | None,
+    github_isResolved: bool = False,
 ) -> VerdictDecision:
     """Apply SWM-1101 steps 3-6 in order, returning the final verdict.
 
-    Step 6 (Codex follow-up) acts as an override on whatever step 3-5 produced.
+    `github_isResolved` is the system-of-record fast-path: if GitHub says
+    the thread is resolved (manual UI resolve, prior Stage 1.5 sync, or
+    SWM-1103 maintainer override), trust it over the local classifier.
+    Otherwise, step 6 (Codex follow-up) overrides steps 3-5.
     """
+    # Step 0 — GitHub system-of-record override.
+    if github_isResolved:
+        return VerdictDecision(
+            Verdict.RESOLVED,
+            "GitHub reports isResolved=true (external resolve / Stage 1.5 sync / maintainer override)",
+        )
+
     # Step 6 short-circuit — explicit Codex approval / rejection wins.
     reaction = codex_followup_reaction(codex_followup_body)
     if reaction == "positive":

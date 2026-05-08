@@ -97,3 +97,40 @@ def test_extra_fields_preserved_on_thread() -> None:
 
     # Assert
     assert parsed.model_dump().get("custom_field") == "watchdog-vendor-extension"
+
+
+# --- CHG-1105 BoxMiss model -------------------------------------------------
+
+
+def test_box_miss_round_trip_serialization() -> None:
+    """BoxMiss must JSON-round-trip through pydantic; this is the on-disk shape."""
+    from datetime import datetime, timezone
+    from swm.models import BoxMiss
+    miss = BoxMiss(
+        ts=datetime(2026, 5, 8, 1, 53, 29, tzinfo=timezone.utc),
+        repo="frankyxhl/trinity",
+        pr=67,
+        head_sha="5c53bd43289d8ca8297fffb0e93b7d42aa6892a7",
+        box_text="CI ubuntu-latest passes",
+        rule_id="ci.ubuntu",
+        reason="no CI runs (paths-ignore / docs-only); parent verdict=pending",
+    )
+    raw = miss.model_dump_json()
+    loaded = BoxMiss.model_validate_json(raw)
+    assert loaded == miss
+
+
+def test_box_miss_accepts_null_rule_id_for_coverage_gap_branch() -> None:
+    """rule_id=None is the coverage-gap branch — distinct from predicate-refused
+    where rule_id is set."""
+    from datetime import datetime, timezone
+    from swm.models import BoxMiss
+    miss = BoxMiss(
+        ts=datetime(2026, 5, 8, 1, 0, 0, tzinfo=timezone.utc),
+        repo="x/y",
+        pr=1,
+        head_sha="abc12345",
+        box_text="CHANGELOG updated",
+        reason="no rule matched — manual check required",
+    )
+    assert miss.rule_id is None

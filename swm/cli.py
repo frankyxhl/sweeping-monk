@@ -7,7 +7,8 @@ Today's commands (read-only on disk state):
 """
 from __future__ import annotations
 
-from datetime import datetime
+import re
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Optional
 
@@ -20,10 +21,31 @@ from rich.table import Table
 from . import dashboard, guarded
 from .gh import GhClient, GhCommandError
 from .poll import poll as run_poll
-from .state import StateStore, default_store
+from .state import StateStore, default_store, now_utc
 
 app = typer.Typer(help="Sweeping-Monk PR watchdog CLI", no_args_is_help=True)
 console = Console()
+
+
+_REPO_RE = re.compile(r"^[^/]+/[^/]+$")
+
+
+def _validate_repo(value: str | None) -> str | None:
+    """Callback for typer.Argument: ensure repo looks like 'owner/name'.
+
+    None passes through (some commands accept Optional[str] repo).
+    Non-None must contain exactly one ``/`` separating non-empty owner and name.
+    Raises typer.BadParameter on malformed input so the user sees a clean
+    one-line error (exit 2) instead of a Python traceback from state.py.
+    """
+    if value is None:
+        return value
+    if not _REPO_RE.match(value):
+        raise typer.BadParameter(
+            f"expected 'owner/repo' format, got {value!r}",
+            param_hint="repo",
+        )
+    return value
 
 
 def _store(state_dir: Optional[str]) -> StateStore:
@@ -32,7 +54,7 @@ def _store(state_dir: Optional[str]) -> StateStore:
 
 @app.command("dashboard")
 def dashboard_cmd(
-    repo: str = typer.Argument(..., help="owner/repo, e.g. frankyxhl/trinity"),
+    repo: str = typer.Argument(..., help="owner/repo, e.g. frankyxhl/trinity", callback=_validate_repo),
     state_dir: Optional[str] = typer.Option(None, "--state-dir", help="Override state/ directory (tests)"),
 ) -> None:
     """Render latest poll for each PR as rich panels."""
@@ -51,7 +73,7 @@ def dashboard_cmd(
 
 @app.command()
 def history(
-    repo: str = typer.Argument(..., help="owner/repo"),
+    repo: str = typer.Argument(..., help="owner/repo", callback=_validate_repo),
     pr: Optional[int] = typer.Option(None, "--pr", help="Filter to one PR number"),
     state_dir: Optional[str] = typer.Option(None, "--state-dir"),
 ) -> None:
@@ -67,7 +89,7 @@ def history(
 
 @app.command()
 def summary(
-    repo: str = typer.Argument(..., help="owner/repo"),
+    repo: str = typer.Argument(..., help="owner/repo", callback=_validate_repo),
     state_dir: Optional[str] = typer.Option(None, "--state-dir"),
 ) -> None:
     """One row per open PR with status + Codex resolution counts."""
@@ -81,7 +103,7 @@ def summary(
 
 @app.command("poll")
 def poll_cmd(
-    repo: str = typer.Argument(..., help="owner/repo, e.g. frankyxhl/trinity"),
+    repo: str = typer.Argument(..., help="owner/repo, e.g. frankyxhl/trinity", callback=_validate_repo),
     sync: bool = typer.Option(False, "--sync", help="Stage 1.5: resolve GitHub threads when local verdict=RESOLVED"),
     base: str = typer.Option("main", "--base", help="Base branch to filter PRs by"),
     state_dir: Optional[str] = typer.Option(None, "--state-dir"),
@@ -114,7 +136,7 @@ def _abort(message: str) -> None:
 
 @app.command("approve")
 def approve_cmd(
-    repo: str = typer.Argument(..., help="owner/repo"),
+    repo: str = typer.Argument(..., help="owner/repo", callback=_validate_repo),
     pr: int = typer.Argument(..., help="PR number"),
     reason: str = typer.Option(..., "--reason", help="One-line maintainer authorization phrase (lands in the ledger)"),
     yes: bool = typer.Option(False, "--yes", "-y", help="Skip the [y/N] confirmation prompt"),
@@ -199,7 +221,7 @@ def approve_cmd(
 
 @app.command("tick")
 def tick_cmd(
-    repo: str = typer.Argument(..., help="owner/repo"),
+    repo: str = typer.Argument(..., help="owner/repo", callback=_validate_repo),
     pr: int = typer.Argument(..., help="PR number"),
     reason: str = typer.Option(..., "--reason", help="One-line maintainer authorization phrase (lands in the ledger)"),
     yes: bool = typer.Option(False, "--yes", "-y"),
@@ -246,6 +268,16 @@ def tick_cmd(
         raise typer.Exit(code=0)
 
     classifications = [guarded.classify_box(b, poll) for b in boxes]
+
+    # CHG-1105: persist every skipped classification as a box-miss observation.
+    # Misses are observations of what the classifier saw — recorded regardless
+    # of whether the user later confirms the flip. `poll.head_sha == current_head`
+    # here by `supports_tick()`'s freshness gate; `build_box_miss` uses the
+    # poll's head, which is the SHA the classifier actually classified against.
+    for c in classifications:
+        if not c.should_flip:
+            store.append_box_miss(guarded.build_box_miss(classification=c, poll=poll))
+
     table = Table(show_header=True, header_style="bold")
     table.add_column("L#", justify="right")
     table.add_column("Box")
@@ -300,7 +332,7 @@ def tick_cmd(
 
 @app.command("ledger")
 def ledger_cmd(
-    repo: str = typer.Argument(..., help="owner/repo"),
+    repo: str = typer.Argument(..., help="owner/repo", callback=_validate_repo),
     pr: int = typer.Argument(..., help="PR number"),
     state_dir: Optional[str] = typer.Option(None, "--state-dir"),
 ) -> None:
@@ -320,6 +352,74 @@ def ledger_cmd(
         ts = e.ts.strftime("%Y-%m-%d %H:%M:%S") if isinstance(e.ts, datetime) else str(e.ts)
         action = e.action.value if hasattr(e.action, "value") else str(e.action)
         table.add_row(ts, action, e.actor, e.head_sha[:8], e.reason)
+    console.print(table)
+
+
+_SINCE_RE = re.compile(r"^(\d+)([dhm])$")
+
+
+def _parse_since(since: str) -> timedelta:
+    """`Nd` / `Nh` / `Nm` → timedelta. Raises typer.BadParameter on bad input
+    so the user sees a clean one-line error instead of a Python traceback."""
+    m = _SINCE_RE.match(since.strip())
+    if not m:
+        raise typer.BadParameter(f"expected Nd / Nh / Nm, got {since!r}", param_hint="--since")
+    n, unit = int(m.group(1)), m.group(2)
+    return timedelta(days=n) if unit == "d" else timedelta(hours=n) if unit == "h" else timedelta(minutes=n)
+
+
+def _canonicalize_box_text(text: str) -> str:
+    """CHG-1105: lowercase + collapse internal whitespace. No punctuation strip."""
+    return " ".join(text.lower().split())
+
+
+@app.command("rule-coverage")
+def rule_coverage_cmd(
+    repo: Optional[str] = typer.Argument(None, help="owner/repo (optional; default: every repo)", callback=_validate_repo),
+    since: str = typer.Option("7d", "--since", help="Time window: Nd / Nh / Nm"),
+    threshold: int = typer.Option(3, "--threshold", help="Hide rows with count < N"),
+    state_dir: Optional[str] = typer.Option(None, "--state-dir"),
+) -> None:
+    """CHG-1105 — surface classifier blind spots from accumulated `box-misses.jsonl`.
+
+    Groups misses by canonical box text (lowercased + whitespace-collapsed),
+    sorts by count descending, hides rows below `--threshold` (default 3) and
+    older than `--since` (default 7 days). For each group, reports the rule_id
+    seen on the latest miss — `—` means no BOX_RULES regex matched (coverage
+    gap), a rule_id means the regex matched but the predicate refused.
+    """
+    store = _store(state_dir)
+    cutoff = now_utc() - _parse_since(since)
+    misses = [m for m in store.read_box_misses(repo) if m.ts >= cutoff]
+    if not misses:
+        scope = f" {repo}" if repo else ""
+        console.print(f"[yellow]no box misses recorded for{scope} (since {since})[/yellow]")
+        raise typer.Exit(code=0)
+
+    groups: dict[str, list] = {}
+    for m in misses:
+        groups.setdefault(_canonicalize_box_text(m.box_text), []).append(m)
+
+    rows = [(canon, ms) for canon, ms in groups.items() if len(ms) >= threshold]
+    rows.sort(key=lambda r: -len(r[1]))
+    if not rows:
+        console.print(
+            f"[yellow]no patterns hit threshold {threshold} (try --threshold 1)[/yellow]"
+        )
+        raise typer.Exit(code=0)
+
+    table = Table(
+        title=f"Box-miss coverage — since {since}, threshold {threshold}",
+        show_header=True, header_style="bold",
+    )
+    table.add_column("count", justify="right")
+    table.add_column("canonical text")
+    table.add_column("matched_rule")
+    table.add_column("last seen (UTC)", style="dim")
+    for canon, ms in rows:
+        latest = max(ms, key=lambda m: m.ts)
+        rule = latest.rule_id or "—"
+        table.add_row(str(len(ms)), canon[:80], rule, latest.ts.strftime("%Y-%m-%d %H:%M"))
     console.print(table)
 
 

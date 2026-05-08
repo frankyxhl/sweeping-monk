@@ -16,6 +16,8 @@
 | 1104 | CHG | Guarded Writes Automation |
 | 1105 | CHG | Classifier Blind Spot Visibility |
 | 1106 | SOP | Rule Addition Cycle |
+| 1107 | CHG | Watch Quiet Mode |
+| 1108 | CHG | Watchdog Daemon |
 
 ---
 

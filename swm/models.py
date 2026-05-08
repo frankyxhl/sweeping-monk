@@ -139,6 +139,20 @@ class GitHubThreadState(BaseModel):
     synced_at: datetime | None = None
 
 
+class BoxMiss(BaseModel):
+    """One skipped-box observation from `swm tick`. rule_id=None → coverage gap;
+    rule_id set → predicate refused. Feeds `swm rule-coverage` (CHG-1105)."""
+    model_config = ConfigDict(extra="allow")
+
+    ts: datetime
+    repo: str
+    pr: int
+    head_sha: str
+    box_text: str
+    rule_id: str | None = None
+    reason: str
+
+
 class LedgerAction(str, Enum):
     SUBMIT_REVIEW_APPROVE = "submit_review_approve"
     EDIT_PR_BODY_CHECK_BOXES = "edit_pr_body_check_boxes"

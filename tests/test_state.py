@@ -218,3 +218,56 @@ def test_append_poll_skips_blank_lines(store: StateStore, pending_poll: PollReco
 
     # Assert — blanks ignored, both polls returned
     assert len(records) == 2
+
+
+# --- CHG-1105 box-misses helpers --------------------------------------------
+
+
+def test_append_and_read_box_misses_round_trip(store: StateStore) -> None:
+    from datetime import datetime, timezone
+    from swm.models import BoxMiss
+    miss = BoxMiss(
+        ts=datetime(2026, 5, 8, 1, 53, 29, tzinfo=timezone.utc),
+        repo="frankyxhl/trinity",
+        pr=67,
+        head_sha="5c53bd43",
+        box_text="CI ubuntu-latest passes",
+        rule_id="ci.ubuntu",
+        reason="no CI runner matching 'ubuntu'",
+    )
+    store.append_box_miss(miss)
+    store.append_box_miss(miss.model_copy(update={"box_text": "CI macos-latest passes", "rule_id": "ci.macos"}))
+    out = list(store.read_box_misses("frankyxhl/trinity"))
+    assert len(out) == 2
+    assert {m.box_text for m in out} == {"CI ubuntu-latest passes", "CI macos-latest passes"}
+
+
+def test_read_box_misses_filters_by_repo(store: StateStore) -> None:
+    from datetime import datetime, timezone
+    from swm.models import BoxMiss
+    common = dict(
+        ts=datetime(2026, 5, 8, 1, 0, 0, tzinfo=timezone.utc),
+        head_sha="abc",
+        box_text="x",
+        rule_id=None,
+        reason="r",
+    )
+    store.append_box_miss(BoxMiss(repo="a/b", pr=1, **common))
+    store.append_box_miss(BoxMiss(repo="c/d", pr=2, **common))
+    a = list(store.read_box_misses("a/b"))
+    assert len(a) == 1 and a[0].repo == "a/b"
+    all_misses = list(store.read_box_misses())
+    assert len(all_misses) == 2
+
+
+def test_read_box_misses_returns_empty_when_directory_missing(store: StateStore) -> None:
+    """No state/ at all — read returns empty without raising."""
+    out = list(store.read_box_misses("never/ran"))
+    assert out == []
+
+
+def test_box_misses_path_layout(store: StateStore) -> None:
+    """File lives at state/<owner>/<repo>/pr-<N>/box-misses.jsonl, alongside polls.jsonl + ledger.jsonl."""
+    p = store._box_misses_path("a/b", 7)
+    assert p.parent == store._pr_dir("a/b", 7)
+    assert p.name == "box-misses.jsonl"
