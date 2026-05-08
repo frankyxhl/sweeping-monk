@@ -15,6 +15,7 @@ This file is the central, always-loaded contract. The detailed operational SOPs 
 - `SWM-1100` (SOP) — **PR Watch Poll Cycle**: the canonical 5-minute polling procedure (`gh` calls, state-key comparison, when to short-circuit, what to print).
 - `SWM-1101` (SOP) — **Codex Resolution Verification**: the decision tree for deciding whether each `chatgpt-codex-connector[bot]` comment is RESOLVED / OPEN / NEEDS_HUMAN_JUDGMENT.
 - `SWM-1102` (REF) — **Severity Promotion Rules**: how external (Codex) P1/P2/P3 labels translate into effective local severity given current repo context (e.g., branch protection state).
+- `SWM-1103` (SOP) — **Maintainer-Authorized One-Shot Writes**: the safe procedure for executing a Stage-3+ write (approve review, edit PR body, merge) when the maintainer explicitly authorizes it inside an interactive session — identity check, verdict gate, head-SHA freshness check, ledger entry.
 
 `ready` is gated on **all** of: CI green, no local P1/P2, every Codex thread RESOLVED per SWM-1101, and Codex's last action on the current head is positive (reaction / approval / silence after fix). CI green alone is not sufficient.
 
@@ -33,12 +34,15 @@ Still forbidden in Stage 1.5 (write actions reserved for Stage 2+):
 
 - Posting any comment, review, or message to GitHub.
 - Submitting `APPROVE`, `REQUEST_CHANGES`, or `COMMENT` reviews.
+- Editing the PR title, body, labels, assignees, or milestone.
 - Merging PRs, enabling auto-merge, changing branch protection or CODEOWNERS.
 - Pushing commits, executing PR-branch code, creating bot accounts, or rotating tokens.
 - Resolving threads on PRs the watchdog has not locally evaluated (no "blanket resolve").
 - Resolving threads whose locally-computed verdict is anything other than `RESOLVED`.
 
 Stage 1.5 mutation guardrail: every `resolveReviewThread` call must be preceded by a fresh GraphQL read confirming the thread is currently `isResolved: false`. Log the thread node ID, the local verdict, and the verdict reason in the watchdog's report.
+
+**One-shot exception** — when the maintainer explicitly authorizes a Stage-3+ write inside an interactive session (e.g., "approve this PR on my behalf", "tick the now-satisfied checkboxes"), follow `SWM-1103` instead of refusing. The authorization is per-action and per-PR; it does not raise the watchdog's default permission stage. Each one-shot write must be ledgered in `state/<owner>/<repo>/pr-<N>/ledger.jsonl`.
 
 ## Stage 1 Permission Model
 
