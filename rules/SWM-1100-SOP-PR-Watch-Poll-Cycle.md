@@ -116,7 +116,7 @@ Use the JSON shape from CLAUDE.md "Output Format". Add a top-level `codex` field
 
 The Chinese summary should name the changed dimension explicitly: head_sha bumped / new Codex thread / CI flipped / Codex reacted positively.
 
-When status flips to `ready`, the notification MUST include an offer to approve: the watchdog runs `swm approve <repo> <N> --reason "..." --yes` per SWM-1103 so the maintainer only needs to merge. If the poll was run with `--sync` (Stage 1.5 active), the approval is a natural extension of the same authorization — offer it proactively, don't wait to be asked.
+When status flips to `ready`, the notification MUST proactively offer to approve per SWM-1103 (e.g., "PR ready. Want me to approve? I'll run `swm approve <repo> <N> --reason ...` — then you just merge."). The offer must be explicit and the approval action must be confirmed by the maintainer per SWM-1103 §When to Use. `--sync` is a Stage 1.5 thread-sync flag — it does NOT authorize Stage-3 approve writes. The maintainer must name the approve action; do not auto-approve without being asked.
 
 ### 7. Update cache + decide notification
 
