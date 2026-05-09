@@ -5,6 +5,7 @@ import json
 
 import pytest
 
+from swm import gh as gh_module
 from swm.gh import GhClient, GhCommandError, GhResult
 
 
@@ -72,6 +73,17 @@ def test_branch_protection_returns_none_on_404() -> None:
     runner = StubRunner()
     runner.expect(("api", "repos/owner/repo/branches/main/protection"),
                   code=1, stderr="HTTP 404: Branch not protected")
+    client = GhClient(runner=runner)
+
+    # Act / Assert
+    assert client.branch_protection("owner/repo", "main") is None
+
+
+def test_branch_protection_returns_none_when_app_token_cannot_read_protection() -> None:
+    # Arrange
+    runner = StubRunner()
+    runner.expect(("api", "repos/owner/repo/branches/main/protection"),
+                  code=1, stderr="gh: Resource not accessible by integration (HTTP 403)")
     client = GhClient(runner=runner)
 
     # Act / Assert
@@ -150,6 +162,91 @@ def test_unresolve_thread_unwraps_thread_payload() -> None:
     assert result["isResolved"] is False
 
 
+def test_reply_to_review_comment_uses_rest_payload_file() -> None:
+    runner = StubRunner()
+    runner.expect(
+        ("api", "repos/frankyxhl/alfred/pulls/122/comments/321/replies"),
+        stdout='{"id":654,"body":"ok"}',
+    )
+    gh = GhClient(runner=runner)
+
+    out = gh.reply_to_review_comment("frankyxhl/alfred", 122, 321, "Close reason with `quotes`.")
+
+    assert out["id"] == 654
+    submitted = runner.calls[-1]
+    assert submitted[:2] == ["api", "repos/frankyxhl/alfred/pulls/122/comments/321/replies"]
+    assert submitted[submitted.index("--method") + 1] == "POST"
+    payload_path = submitted[submitted.index("--input") + 1]
+    import os as _os
+    assert not _os.path.exists(payload_path), "payload tempfile must be cleaned up"
+
+
+def test_create_issue_comment_appends_new_timeline_comment() -> None:
+    runner = StubRunner()
+    runner.expect(
+        ("api", "repos/frankyxhl/alfred/issues/123/comments"),
+        stdout='{"id":777,"html_url":"https://github.test/comment"}',
+    )
+    gh = GhClient(runner=runner)
+
+    out = gh.create_issue_comment("frankyxhl/alfred", 123, "Clearance run conclusion")
+
+    assert out["id"] == 777
+    submitted = runner.calls[-1]
+    assert submitted[:2] == ["api", "repos/frankyxhl/alfred/issues/123/comments"]
+    assert submitted[submitted.index("--method") + 1] == "POST"
+    payload_path = submitted[submitted.index("--input") + 1]
+    import os as _os
+    assert not _os.path.exists(payload_path), "payload tempfile must be cleaned up"
+
+
+def test_set_review_comment_reaction_replaces_opposite_status() -> None:
+    runner = StubRunner()
+    runner.expect(
+        ("api", "repos/frankyxhl/alfred/pulls/comments/321/reactions?per_page=100&content=-1"),
+        stdout=json.dumps([{"id": 91, "content": "-1", "user": {"login": "iterwheel-clearance[bot]"}}]),
+    )
+    runner.expect(
+        ("api", "repos/frankyxhl/alfred/pulls/comments/321/reactions/91"),
+        stdout="",
+    )
+    runner.expect(
+        ("api", "repos/frankyxhl/alfred/pulls/comments/321/reactions?per_page=100&content=%2B1"),
+        stdout="[]",
+    )
+    runner.expect(
+        ("api", "repos/frankyxhl/alfred/pulls/comments/321/reactions"),
+        stdout=json.dumps({"id": 92, "content": "+1"}),
+    )
+    gh = GhClient(runner=runner, actor_login="iterwheel-clearance[bot]")
+
+    out = gh.set_review_comment_reaction("frankyxhl/alfred", 321, "+1")
+
+    assert out["content"] == "+1"
+    assert out["removed"][0]["id"] == 91
+    assert out["added"]["id"] == 92
+    delete_call = runner.calls[1]
+    assert delete_call[:2] == ["api", "repos/frankyxhl/alfred/pulls/comments/321/reactions/91"]
+    assert delete_call[delete_call.index("--method") + 1] == "DELETE"
+    post_call = runner.calls[-1]
+    assert post_call[:2] == ["api", "repos/frankyxhl/alfred/pulls/comments/321/reactions"]
+    assert post_call[post_call.index("--method") + 1] == "POST"
+
+
+def test_add_review_comment_reaction_is_idempotent_for_same_actor() -> None:
+    runner = StubRunner()
+    runner.expect(
+        ("api", "repos/frankyxhl/alfred/pulls/comments/321/reactions?per_page=100&content=%2B1"),
+        stdout=json.dumps([{"id": 92, "content": "+1", "user": {"login": "iterwheel-clearance[bot]"}}]),
+    )
+    gh = GhClient(runner=runner, actor_login="iterwheel-clearance[bot]")
+
+    out = gh.add_review_comment_reaction("frankyxhl/alfred", 321, "+1")
+
+    assert out["already_exists"] is True
+    assert len(runner.calls) == 1
+
+
 def test_command_error_raises_for_non_404_failures() -> None:
     # Arrange
     runner = StubRunner()
@@ -196,6 +293,32 @@ def test_auth_active_login_raises_when_unparseable() -> None:
         gh.auth_active_login()
 
 
+def test_auth_active_login_can_be_supplied_for_app_actor() -> None:
+    gh = GhClient(runner=lambda args: GhResult(1, "", "should not run"), actor_login="iterwheel-clearance[bot]")
+    assert gh.auth_active_login() == "iterwheel-clearance[bot]"
+
+
+def test_default_runner_sets_gh_token_env(monkeypatch) -> None:
+    seen = {}
+
+    class Proc:
+        returncode = 0
+        stdout = "{}"
+        stderr = ""
+
+    def fake_run(cmd, *, capture_output, text, env=None):
+        seen["cmd"] = cmd
+        seen["env"] = env
+        return Proc()
+
+    monkeypatch.setattr(gh_module.subprocess, "run", fake_run)
+    result = gh_module._default_runner(["api", "user"], token="installation-token")
+
+    assert result.returncode == 0
+    assert seen["cmd"] == ["gh", "api", "user"]
+    assert seen["env"]["GH_TOKEN"] == "installation-token"
+
+
 def test_submit_review_approve_uses_body_file_not_arg_expansion() -> None:
     """SWM-1104 fix: arbitrary maintainer text must go through --body-file (no shell expansion)."""
     runner = StubRunner()
@@ -218,6 +341,28 @@ def test_submit_review_approve_raises_on_gh_failure() -> None:
     gh = GhClient(runner=runner)
     with pytest.raises(GhCommandError, match="gh pr review --approve failed"):
         gh.submit_review_approve("frankyxhl/trinity", 66, body="x")
+
+
+def test_submit_review_approve_with_commit_id_uses_rest_payload_file() -> None:
+    runner = StubRunner()
+    runner.expect(("api", "repos/frankyxhl/trinity/pulls/66/reviews"), stdout='{"state":"APPROVED"}')
+    gh = GhClient(runner=runner)
+
+    out = gh.submit_review_approve(
+        "frankyxhl/trinity",
+        66,
+        body="Approved by Clearance",
+        commit_id="abc123",
+    )
+
+    assert "APPROVED" in out["stdout"]
+    submitted = runner.calls[-1]
+    assert submitted[:2] == ["api", "repos/frankyxhl/trinity/pulls/66/reviews"]
+    assert "--method" in submitted
+    assert submitted[submitted.index("--method") + 1] == "POST"
+    payload_path = submitted[submitted.index("--input") + 1]
+    import os as _os
+    assert not _os.path.exists(payload_path), "payload tempfile must be cleaned up"
 
 
 def test_edit_pr_body_uses_body_file_and_cleans_up(tmp_path) -> None:
