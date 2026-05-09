@@ -102,6 +102,38 @@ def test_latest_author_reply_skips_codex_followups() -> None:
     assert reply["databaseId"] == 2
 
 
+def test_latest_author_reply_skips_swm_marker_replies() -> None:
+    # Arrange — Codex top, then a Clearance conclusion reply (swm marker), then a real author reply
+    swm_body = "<!-- swm-thread-conclusion:PRRT_abc:deadbeef1234 -->\nClearance conclusion for this review thread:\n..."
+    thread = _thread(comments=[
+        _comment("chatgpt-codex-connector", "P2: fix the null check"),
+        _comment("iterwheel-clearance[bot]", swm_body, db_id=9),
+        _comment("ryosaeba1985", "fixed in abc123", db_id=10),
+    ])
+
+    # Act
+    reply = classify.latest_author_reply(thread)
+
+    # Assert — the Clearance marker comment is skipped; real author reply returned
+    assert reply is not None
+    assert reply["databaseId"] == 10
+
+
+def test_latest_author_reply_returns_none_when_only_swm_marker_present() -> None:
+    # Arrange — Codex top, then only a Clearance conclusion reply with no human reply
+    swm_body = "<!-- swm-close-reason:PRRT_abc:deadbeef1234 -->\nClearance verification before resolving..."
+    thread = _thread(comments=[
+        _comment("chatgpt-codex-connector", "P1: serious issue"),
+        _comment("iterwheel-clearance[bot]", swm_body, db_id=7),
+    ])
+
+    # Act
+    reply = classify.latest_author_reply(thread)
+
+    # Assert — no real author reply; Clearance marker must not satisfy the check
+    assert reply is None
+
+
 def test_codex_pr_body_signal_thumbs_up_means_approved() -> None:
     # Arrange — Codex bot left a 👍 reaction on the PR body
     reactions = [{"content": "THUMBS_UP", "user": {"login": "chatgpt-codex-connector[bot]"}, "createdAt": "2026-05-07T12:00:00Z"}]
