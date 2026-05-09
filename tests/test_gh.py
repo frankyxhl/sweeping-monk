@@ -79,15 +79,17 @@ def test_branch_protection_returns_none_on_404() -> None:
     assert client.branch_protection("owner/repo", "main") is None
 
 
-def test_branch_protection_returns_none_when_app_token_cannot_read_protection() -> None:
-    # Arrange
+def test_branch_protection_returns_sentinel_when_app_token_cannot_read_protection() -> None:
+    # A 403 must NOT return None (which would set branch_protected=False).
+    # It must return a non-None sentinel so callers treat the branch as protected.
     runner = StubRunner()
     runner.expect(("api", "repos/owner/repo/branches/main/protection"),
                   code=1, stderr="gh: Resource not accessible by integration (HTTP 403)")
     client = GhClient(runner=runner)
 
-    # Act / Assert
-    assert client.branch_protection("owner/repo", "main") is None
+    result = client.branch_protection("owner/repo", "main")
+    assert result is not None
+    assert result.get("_unknown") is True
 
 
 def test_branch_protection_returns_dict_when_protected() -> None:

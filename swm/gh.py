@@ -250,12 +250,13 @@ class GhClient:
         return result.stdout
 
     def branch_protection(self, repo: str, branch: str) -> dict | None:
-        """Returns None when protection cannot be observed by this token.
+        """Returns None only when the branch is confirmed unprotected (HTTP 404).
 
-        GitHub App installation tokens without administration access receive
-        HTTP 403 for this endpoint. Clearance must still be able to evaluate PR
-        readiness, so treat that as "unknown/not protected" instead of failing
-        the entire poll.
+        A 403 "Resource not accessible by integration" means the GitHub App
+        lacks Administration read permission — protection status is unknown.
+        Return a sentinel {"_unknown": True} so callers see a non-None value
+        and treat the branch as protected (fail-safe). This prevents severity
+        demotion on branches that may well have required checks configured.
         """
         args = ["api", f"repos/{repo}/branches/{branch}/protection"]
         result = self._run(args)
@@ -264,12 +265,13 @@ class GhClient:
                 "HTTP 404" in result.stderr
                 or "Not Found" in result.stderr
                 or "Branch not protected" in result.stderr
-                or (
-                    "HTTP 403" in result.stderr
-                    and "Resource not accessible by integration" in result.stderr
-                )
             ):
                 return None
+            if (
+                "HTTP 403" in result.stderr
+                and "Resource not accessible by integration" in result.stderr
+            ):
+                return {"_unknown": True}
             raise GhCommandError(f"gh {' '.join(args)!r} failed: {result.stderr.strip()}")
         if not result.stdout.strip():
             return None
