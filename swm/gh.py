@@ -119,17 +119,30 @@ class GhClient:
         data = self._json(args) or {}
         return dict(data)
 
+    def _paginated_list(self, args: list[str]) -> list[dict]:
+        """Run a paginated gh api call and return a flat list.
+
+        gh api --paginate without --slurp concatenates raw JSON arrays
+        (e.g. [...][...]), which json.loads rejects. --slurp wraps pages
+        into [[page1...], [page2...]], which is valid JSON; we flatten it.
+        """
+        result = self._run([*args, "--paginate", "--slurp"])
+        if result.returncode != 0:
+            raise GhCommandError(f"gh {' '.join(args)!r} failed: {result.stderr.strip()}")
+        if not result.stdout.strip():
+            return []
+        data = json.loads(result.stdout)
+        if data and isinstance(data[0], list):
+            return [item for page in data for item in page]
+        return list(data)
+
     def pulls_comments(self, repo: str, pr: int) -> list[dict]:
         """Inline review comments (REST). Includes path, line, in_reply_to_id."""
-        args = ["api", f"repos/{repo}/pulls/{pr}/comments", "--paginate"]
-        data = self._json(args) or []
-        return list(data)
+        return self._paginated_list(["api", f"repos/{repo}/pulls/{pr}/comments"])
 
     def issues_comments(self, repo: str, pr: int) -> list[dict]:
         """Issue-thread comments (REST). PRs are issues for this endpoint."""
-        args = ["api", f"repos/{repo}/issues/{pr}/comments", "--paginate"]
-        data = self._json(args) or []
-        return list(data)
+        return self._paginated_list(["api", f"repos/{repo}/issues/{pr}/comments"])
 
     @property
     def actor_login(self) -> str | None:

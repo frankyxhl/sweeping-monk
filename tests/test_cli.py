@@ -376,6 +376,42 @@ def test_close_items_command_marks_unresolved_items_without_resolving(store: Sta
     assert "Closed this run: `0`" in write_calls[2][2]["body"]
 
 
+def test_close_items_aborts_when_head_drifts_after_confirmation(store: StateStore, monkeypatch) -> None:
+    """TOCTOU guard: close-items must re-read head SHA after confirmation and abort on drift."""
+    from tests.conftest import FakeGhClient
+    from swm.investigator import InvestigationDecision
+
+    class FakeInvestigator:
+        def investigate(self, item):
+            return InvestigationDecision(verdict="RESOLVED", confidence=0.9, reason="ok", evidence=[])
+
+    class DriftingGh(FakeGhClient):
+        def view_pr(self, repo, pr, fields):
+            self._record("view_pr", repo, pr, fields=fields)
+            view_calls = sum(1 for c in self.calls if c[0] == "view_pr")
+            # close-items issues exactly one view_pr (the TOCTOU recheck); drift on it.
+            if view_calls >= 1 and "headRefOid" in fields:
+                return {**next(p for p in self._prs if p["number"] == pr), "headRefOid": "drifted99" + "0" * 31}
+            return next(p for p in self._prs if p["number"] == pr)
+
+    fake = DriftingGh(
+        prs=[_open_pr(49)],
+        review_threads={49: [_codex_review_thread("PRRT_49")]},
+    )
+    monkeypatch.setattr("swm.cli.GhClient", lambda: fake)
+    monkeypatch.setattr("swm.cli.build_investigator_from_env", lambda: FakeInvestigator())
+
+    result = runner.invoke(app, [
+        "close-items", "owner/repo", "49", "--yes",
+        "--state-dir", str(store.directory),
+    ])
+
+    assert result.exit_code == 1
+    assert "head changed since poll" in result.stdout or "re-run close-items" in result.stdout
+    write_calls = [c for c in fake.calls if c[0] in {"set_review_comment_reaction", "resolve_thread"}]
+    assert write_calls == [], "no writebacks should occur when head drifts"
+
+
 # --- SWM-1104 guarded subcommand tests --------------------------------------
 
 

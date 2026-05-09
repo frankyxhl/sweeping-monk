@@ -339,6 +339,14 @@ def close_items_cmd(
         console.print("[yellow]aborted[/yellow]")
         raise typer.Exit(code=1)
 
+    current_pr = gh_client.view_pr(repo, pr, ["headRefOid"])
+    current_head = current_pr.get("headRefOid", "")
+    if current_head != record.head_sha:
+        _abort(
+            f"PR head changed since poll ({record.head_sha[:8]} → {current_head[:8]}); "
+            "re-run close-items to poll the new head"
+        )
+
     reply_results: dict[str, dict] = {}
     reaction_results: dict[str, dict] = {}
     actions = []

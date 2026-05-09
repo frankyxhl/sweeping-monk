@@ -388,3 +388,39 @@ def test_edit_pr_body_raises_on_gh_failure() -> None:
     gh = GhClient(runner=runner)
     with pytest.raises(GhCommandError, match="gh pr edit --body-file failed"):
         gh.edit_pr_body("frankyxhl/trinity", 66, body="x")
+
+
+def test_pulls_comments_flattens_paginated_slurp_output() -> None:
+    # gh api --paginate --slurp wraps multiple pages into [[page1...], [page2...]].
+    # _paginated_list must flatten to a single list; json.loads on bare concatenation fails.
+    page1 = [{"id": 1, "body": "first"}]
+    page2 = [{"id": 2, "body": "second"}, {"id": 3, "body": "third"}]
+    import json as _json
+    slurp_output = _json.dumps([page1, page2])
+
+    runner = StubRunner()
+    runner.expect(
+        ("api", "repos/owner/repo/pulls/7/comments"),
+        stdout=slurp_output,
+    )
+    gh = GhClient(runner=runner)
+    result = gh.pulls_comments("owner/repo", 7)
+
+    assert len(result) == 3
+    assert result[0]["id"] == 1
+    assert result[2]["id"] == 3
+
+
+def test_pulls_comments_handles_single_page_slurp_output() -> None:
+    # When only one page exists, --slurp still wraps it in an outer list.
+    import json as _json
+    single_page = [{"id": 10, "body": "only"}]
+    runner = StubRunner()
+    runner.expect(
+        ("api", "repos/owner/repo/pulls/8/comments"),
+        stdout=_json.dumps([single_page]),
+    )
+    gh = GhClient(runner=runner)
+    result = gh.pulls_comments("owner/repo", 8)
+    assert len(result) == 1
+    assert result[0]["id"] == 10
