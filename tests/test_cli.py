@@ -1,6 +1,9 @@
 """Unit tests for the typer CLI — uses CliRunner against a tmp state dir."""
 from __future__ import annotations
 
+from pathlib import Path
+from types import SimpleNamespace
+
 from typer.testing import CliRunner
 
 from swm.cli import app
@@ -15,6 +18,43 @@ def _seed(store: StateStore, polls: list[PollRecord], snapshots: list[ThreadSnap
         store.append_poll(p)
     for s in snapshots or []:
         store.write_thread(s)
+
+
+def _open_pr(number: int, *, head: str | None = None, base: str = "main") -> dict:
+    return {
+        "number": number,
+        "title": f"demo #{number}",
+        "headRefOid": head or (f"head{number}" + "0" * 34),
+        "baseRefName": base,
+        "isDraft": False,
+        "mergeStateStatus": "CLEAN",
+        "statusCheckRollup": [{"name": "ci", "conclusion": "SUCCESS"}],
+        "updatedAt": "2026-05-07T12:00:00Z",
+    }
+
+
+def _codex_review_thread(
+    thread_id: str,
+    *,
+    is_outdated: bool = True,
+    is_resolved: bool = False,
+) -> dict:
+    return {
+        "id": thread_id,
+        "isResolved": is_resolved,
+        "isOutdated": is_outdated,
+        "path": "app.py",
+        "line": 12,
+        "comments": {
+            "nodes": [{
+                "databaseId": 1001,
+                "author": {"login": "chatgpt-codex-connector"},
+                "body": "**P3** stale docs concern",
+                "createdAt": "2026-05-07T12:00:00Z",
+                "replyTo": None,
+            }],
+        },
+    }
 
 
 def test_dashboard_command_renders_panel(
@@ -133,6 +173,207 @@ def test_poll_command_says_no_open_prs_when_repo_is_empty(
     # Assert
     assert result.exit_code == 0
     assert "no open PRs" in result.stdout
+
+
+def test_close_items_command_resolves_only_target_pr(store: StateStore, monkeypatch) -> None:
+    from tests.conftest import FakeGhClient
+    from swm.investigator import InvestigationDecision
+
+    class FakeInvestigator:
+        def investigate(self, item):
+            return InvestigationDecision(
+                verdict="RESOLVED",
+                confidence=0.91,
+                reason="the current diff removes the stale threshold guidance",
+                evidence=["the diff no longer includes the fewer-than-3-round skip rule"],
+            )
+
+    fake = FakeGhClient(
+        prs=[_open_pr(49), _open_pr(50)],
+        review_threads={
+            49: [_codex_review_thread("PRRT_49")],
+            50: [_codex_review_thread("PRRT_50")],
+        },
+    )
+    monkeypatch.setattr("swm.cli.GhClient", lambda: fake)
+    monkeypatch.setattr("swm.cli.build_investigator_from_env", lambda: FakeInvestigator())
+
+    result = runner.invoke(app, [
+        "close-items", "owner/repo", "49",
+        "--yes",
+        "--state-dir", str(store.directory),
+    ])
+
+    assert result.exit_code == 0, result.stdout
+    write_calls = [
+        call for call in fake.calls
+        if call[0] in {
+            "set_review_comment_reaction",
+            "reply_to_review_comment",
+            "resolve_thread",
+            "create_issue_comment",
+        }
+    ]
+    assert [call[0] for call in write_calls] == [
+        "set_review_comment_reaction",
+        "reply_to_review_comment",
+        "resolve_thread",
+        "create_issue_comment",
+    ]
+    assert write_calls[0] == ("set_review_comment_reaction", ("owner/repo", 1001, "+1"), {})
+    reply = write_calls[1]
+    assert reply[1][:3] == ("owner/repo", 49, 1001)
+    reply_body = reply[2]["body"]
+    assert "OpenClaw Flash" in reply_body
+    assert "the current diff removes the stale threshold guidance" in reply_body
+    assert "fewer-than-3-round skip rule" in reply_body
+    assert write_calls[2] == ("resolve_thread", ("PRRT_49",), {})
+    run_comment = write_calls[3]
+    assert run_comment[1][:2] == ("owner/repo", 49)
+    assert "Clearance run conclusion" in run_comment[2]["body"]
+    assert "Closed this run: `1`" in run_comment[2]["body"]
+    record = store.latest_poll("owner/repo", 49)
+    assert record is not None
+    assert record.trigger == "manual-close-items+stage1.5-sync"
+    assert record.stage15_actions[0].threadId == "PRRT_49"
+    assert record.stage15_actions[0].result["close_reason_comment"]["id"] == 1002
+    assert store.latest_poll("owner/repo", 50) is None
+
+
+def test_close_items_command_reports_when_nothing_is_closable(store: StateStore, monkeypatch) -> None:
+    from tests.conftest import FakeGhClient
+
+    fake = FakeGhClient(
+        prs=[_open_pr(49)],
+        review_threads={49: [_codex_review_thread("PRRT_49", is_resolved=True)]},
+    )
+    monkeypatch.setattr("swm.cli.GhClient", lambda: fake)
+
+    result = runner.invoke(app, [
+        "close-items", "owner/repo", "49",
+        "--yes",
+        "--state-dir", str(store.directory),
+    ])
+
+    assert result.exit_code == 0, result.stdout
+    assert "no open review items" in result.stdout
+    assert [call for call in fake.calls if call[0] == "resolve_thread"] == []
+    comment_calls = [call for call in fake.calls if call[0] == "create_issue_comment"]
+    assert len(comment_calls) == 1
+    assert "Closed this run: `0`" in comment_calls[0][2]["body"]
+    record = store.latest_poll("owner/repo", 49)
+    assert record is not None
+    assert record.trigger == "manual-close-items"
+
+
+def test_close_items_command_can_use_configured_github_app_actor(store: StateStore, monkeypatch) -> None:
+    from tests.conftest import FakeGhClient
+    from swm.investigator import InvestigationDecision
+
+    class FakeInvestigator:
+        def investigate(self, item):
+            return InvestigationDecision(
+                verdict="RESOLVED",
+                confidence=0.93,
+                reason="verified by app actor test",
+                evidence=["evidence from the current diff"],
+            )
+
+    class FakeTokenProvider:
+        def token_for(self, **kwargs):
+            captured["token_kwargs"] = kwargs
+            return "installation-token"
+
+    fake = FakeGhClient(
+        prs=[_open_pr(49)],
+        review_threads={49: [_codex_review_thread("PRRT_49")]},
+    )
+    captured = {}
+
+    def fake_load_config(path):
+        captured["config_path"] = path
+        actor = SimpleNamespace(
+            app_id=123,
+            installation_id=456,
+            private_key_path=Path("/tmp/clearance.pem"),
+            bot_login="iterwheel-clearance[bot]",
+            api_url="https://api.github.com",
+        )
+        return SimpleNamespace(actor=lambda name: actor)
+
+    def fake_gh_client(*args, **kwargs):
+        captured["gh_kwargs"] = kwargs
+        return fake
+
+    monkeypatch.setattr("swm.cli.load_config", fake_load_config)
+    monkeypatch.setattr("swm.cli.InstallationTokenProvider", FakeTokenProvider)
+    monkeypatch.setattr("swm.cli.GhClient", fake_gh_client)
+    monkeypatch.setattr("swm.cli.build_investigator_from_env", lambda: FakeInvestigator())
+
+    result = runner.invoke(app, [
+        "close-items", "owner/repo", "49",
+        "--actor", "clearance",
+        "--config", "/tmp/watchd.toml",
+        "--yes",
+        "--state-dir", str(store.directory),
+    ])
+
+    assert result.exit_code == 0, result.stdout
+    assert captured["config_path"] == "/tmp/watchd.toml"
+    assert captured["token_kwargs"]["app_id"] == 123
+    assert captured["token_kwargs"]["installation_id"] == 456
+    assert captured["gh_kwargs"] == {
+        "token": "installation-token",
+        "actor_login": "iterwheel-clearance[bot]",
+    }
+    assert [call[0] for call in fake.calls if call[0] in {
+        "set_review_comment_reaction",
+        "reply_to_review_comment",
+        "resolve_thread",
+        "create_issue_comment",
+    }] == [
+        "set_review_comment_reaction",
+        "reply_to_review_comment",
+        "resolve_thread",
+        "create_issue_comment",
+    ]
+
+
+def test_close_items_command_marks_unresolved_items_without_resolving(store: StateStore, monkeypatch) -> None:
+    from tests.conftest import FakeGhClient
+
+    fake = FakeGhClient(
+        prs=[_open_pr(49)],
+        review_threads={49: [_codex_review_thread("PRRT_49", is_outdated=False)]},
+    )
+    monkeypatch.setattr("swm.cli.GhClient", lambda: fake)
+
+    result = runner.invoke(app, [
+        "close-items", "owner/repo", "49",
+        "--yes",
+        "--state-dir", str(store.directory),
+    ])
+
+    assert result.exit_code == 0, result.stdout
+    write_calls = [
+        call for call in fake.calls
+        if call[0] in {
+            "set_review_comment_reaction",
+            "reply_to_review_comment",
+            "resolve_thread",
+            "create_issue_comment",
+        }
+    ]
+    assert [call[0] for call in write_calls] == [
+        "set_review_comment_reaction",
+        "reply_to_review_comment",
+        "create_issue_comment",
+    ]
+    assert write_calls[0] == ("set_review_comment_reaction", ("owner/repo", 1001, "-1"), {})
+    reply_body = write_calls[1][2]["body"]
+    assert "Verdict: `OPEN`" in reply_body
+    assert "left open" in reply_body
+    assert "Closed this run: `0`" in write_calls[2][2]["body"]
 
 
 # --- SWM-1104 guarded subcommand tests --------------------------------------
