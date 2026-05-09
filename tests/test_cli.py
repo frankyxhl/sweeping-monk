@@ -553,6 +553,92 @@ def test_close_items_aborts_when_thread_state_drifts_after_confirmation(store: S
     assert write_calls == [], f"no writebacks expected after drift abort, got: {write_calls}"
 
 
+def test_close_items_aborts_on_verdict_change_without_id_change(store: StateStore, monkeypatch) -> None:
+    """Drift detection must fire when a thread's verdict changes (e.g. OPEN →
+    NEEDS_HUMAN_JUDGMENT) even when the thread IDs are unchanged — catches the
+    case where confirmed_open_ids matched but the displayed reason was stale."""
+    from tests.conftest import FakeGhClient
+    from swm.investigator import InvestigationDecision
+
+    poll_call_count = 0
+
+    class VerdictDriftGh(FakeGhClient):
+        def review_threads(self, repo, pr):
+            nonlocal poll_call_count
+            poll_call_count += 1
+            # Both polls return the same thread ID; only the first is used for the
+            # pre-confirmation display. The investigator returns RESOLVED on call 1
+            # (so the plan shows RESOLVED) but the re-poll sees the thread as
+            # non-outdated (no author reply yet), so the investigator now returns
+            # NEEDS_HUMAN_JUDGMENT — same ID, different verdict.
+            if poll_call_count == 1:
+                return [_codex_review_thread("PRRT_X", is_outdated=True)]
+            # Re-poll: thread is no longer outdated (anchor moved) — classifies
+            # differently and the investigator verdict changes.
+            return [_codex_review_thread("PRRT_X", is_outdated=False)]
+
+    verdict_call = [0]
+
+    class FlipInvestigator:
+        def investigate(self, item):
+            verdict_call[0] += 1
+            if verdict_call[0] == 1:
+                return InvestigationDecision(verdict="RESOLVED", confidence=0.9, reason="ok", evidence=[])
+            return InvestigationDecision(verdict="NEEDS_HUMAN_JUDGMENT", confidence=0.4, reason="unclear", evidence=[])
+
+    fake = VerdictDriftGh(prs=[_open_pr(49)], review_threads={49: []})
+    monkeypatch.setattr("swm.cli.GhClient", lambda: fake)
+    monkeypatch.setattr("swm.cli.build_investigator_from_env", lambda: FlipInvestigator())
+
+    result = runner.invoke(app, [
+        "close-items", "owner/repo", "49", "--yes",
+        "--state-dir", str(store.directory),
+    ])
+
+    assert result.exit_code == 1
+    assert "Thread state changed" in result.stdout or "re-run close-items" in result.stdout
+    write_calls = [c for c in fake.calls if c[0] in {"reply_to_review_comment", "resolve_thread"}]
+    assert write_calls == [], f"no writebacks expected after verdict drift, got: {write_calls}"
+
+
+def _make_thread(thread_id: str, verdict) -> "Thread":
+    from swm.models import Thread, Severity
+    return Thread(
+        id=thread_id,
+        comment_id=42,
+        path="src/foo.py",
+        line=10,
+        codex_severity=Severity.P3,
+        effective_severity=Severity.P3,
+        verdict=verdict,
+        verdict_reason="test",
+    )
+
+
+def test_existing_conclusion_markers_resolved_returns_only_close_reason() -> None:
+    """For a RESOLVED thread, existing_conclusion_markers must only return the
+    swm-close-reason marker — a stale swm-thread-conclusion must not satisfy the
+    pre-resolve check (it carries a 'left open' public message)."""
+    from swm.close_reason import existing_conclusion_markers
+    from swm.models import Verdict
+
+    thread = _make_thread("PRRT_abc", Verdict.RESOLVED)
+    markers = existing_conclusion_markers(thread, head_sha="deadbeef1234abcd")
+    assert markers == [f"swm-close-reason:{thread.id}:deadbeef1234"]
+    assert not any("swm-thread-conclusion" in m for m in markers)
+
+
+def test_existing_conclusion_markers_open_returns_only_conclusion() -> None:
+    """For a non-RESOLVED thread, only the swm-thread-conclusion marker is returned."""
+    from swm.close_reason import existing_conclusion_markers
+    from swm.models import Verdict
+
+    thread = _make_thread("PRRT_xyz", Verdict.NEEDS_HUMAN_JUDGMENT)
+    markers = existing_conclusion_markers(thread, head_sha="cafebabe5678abcd")
+    assert markers == [f"swm-thread-conclusion:{thread.id}:cafebabe5678"]
+    assert not any("swm-close-reason" in m for m in markers)
+
+
 # --- SWM-1104 guarded subcommand tests --------------------------------------
 
 

@@ -335,9 +335,9 @@ def close_items_cmd(
         f"close {len(closable)} resolved item(s), on "
         f"{repo}#{pr} @ {record.head_sha[:8]}"
     )
-    # Snapshot the confirmed plan before waiting for user input.
-    confirmed_closable = {(t.id, t.verdict) for t in closable}
-    confirmed_open_ids = {t.id for t in open_threads}
+    # Snapshot the confirmed plan (id + verdict for every displayed thread) before
+    # waiting for user input. Tracks both set membership and verdict changes.
+    confirmed_open = {(t.id, t.verdict) for t in open_threads}
 
     if not _confirm("Apply?", yes=yes):
         console.print("[yellow]aborted[/yellow]")
@@ -366,10 +366,7 @@ def close_items_cmd(
     open_threads = _open_review_threads(record.threads, snapshots)
     closable = _closable_threads(record.threads, snapshots)
 
-    if (
-        {(t.id, t.verdict) for t in closable} != confirmed_closable
-        or {t.id for t in open_threads} != confirmed_open_ids
-    ):
+    if {(t.id, t.verdict) for t in open_threads} != confirmed_open:
         _abort(
             "Thread state changed while waiting for confirmation — "
             "re-run close-items to see the updated plan"

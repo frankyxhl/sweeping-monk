@@ -31,10 +31,12 @@ def close_reason_marker(thread: Thread, *, head_sha: str) -> str:
 
 
 def existing_conclusion_markers(thread: Thread, *, head_sha: str) -> list[str]:
-    return [
-        conclusion_marker(thread, head_sha=head_sha),
-        close_reason_marker(thread, head_sha=head_sha),
-    ]
+    # For RESOLVED threads, only swm-close-reason satisfies the pre-resolve check.
+    # A stale swm-thread-conclusion (left from an earlier OPEN/NHJ marking on the
+    # same head) must not substitute — it carries a public "left open" message.
+    if _verdict_value(thread) == "RESOLVED":
+        return [close_reason_marker(thread, head_sha=head_sha)]
+    return [conclusion_marker(thread, head_sha=head_sha)]
 
 
 def _evidence_lines(thread: Thread, snapshot: ThreadSnapshot | None) -> list[str]:
