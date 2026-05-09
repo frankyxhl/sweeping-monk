@@ -5,6 +5,7 @@ from datetime import datetime, timedelta, timezone
 
 import pytest
 
+from swm.investigator import InvestigationDecision
 from swm.models import Status, Verdict
 from swm.poll import poll, poll_pr
 from swm.state import StateStore
@@ -55,6 +56,16 @@ def _codex_thread(*, thread_id: str = "T1", isOutdated: bool = False, isResolved
         "line": 31,
         "comments": {"nodes": comments},
     }
+
+
+class FakeInvestigator:
+    def __init__(self, decision: InvestigationDecision):
+        self.decision = decision
+        self.inputs = []
+
+    def investigate(self, item):
+        self.inputs.append(item)
+        return self.decision
 
 
 def test_poll_writes_one_record_per_open_pr(store: StateStore) -> None:
@@ -164,6 +175,54 @@ def test_poll_marks_ready_when_all_threads_resolved_and_ci_green(store: StateSto
     record = outcomes[0].record
     assert record.status is Status.READY
     assert record.threads[0].verdict is Verdict.RESOLVED
+
+
+def test_poll_investigator_can_resolve_replied_thread(store: StateStore) -> None:
+    investigator = FakeInvestigator(
+        InvestigationDecision(
+            verdict="RESOLVED",
+            confidence=0.92,
+            reason="diff removes the reviewed token logging",
+            evidence=["print(token) was removed"],
+        )
+    )
+    gh = FakeGhClient(
+        prs=[_pr_summary(ci=[{"name": "ci", "conclusion": "SUCCESS"}])],
+        review_threads={49: [_codex_thread(body="**P3** token logging concern", reply_body="Fixed it.")]},
+        pr_diffs={49: "diff --git a/app.py b/app.py\n- print(token)\n+ logger.info('ok')\n"},
+    )
+
+    outcomes = poll("owner/repo", store=store, gh_client=gh, investigator=investigator)
+
+    record = outcomes[0].record
+    assert record.status is Status.READY
+    assert record.threads[0].verdict is Verdict.RESOLVED
+    assert record.threads[0].llm_verdict == "RESOLVED"
+    assert record.threads[0].llm_confidence == 0.92
+    assert investigator.inputs[0].diff_excerpt.startswith("diff --git")
+
+
+def test_poll_investigator_can_keep_outdated_thread_open(store: StateStore) -> None:
+    investigator = FakeInvestigator(
+        InvestigationDecision(
+            verdict="OPEN",
+            confidence=0.88,
+            reason="diff does not address the reviewed workflow concern",
+            evidence=["only README changed"],
+        )
+    )
+    gh = FakeGhClient(
+        prs=[_pr_summary(ci=[{"name": "ci", "conclusion": "SUCCESS"}])],
+        review_threads={49: [_codex_thread(isOutdated=True, body="**P3** workflow concern")]},
+        pr_diffs={49: "diff --git a/README.md b/README.md\n+ docs only\n"},
+    )
+
+    outcomes = poll("owner/repo", store=store, gh_client=gh, investigator=investigator)
+
+    record = outcomes[0].record
+    assert record.status is Status.PENDING
+    assert record.threads[0].verdict is Verdict.OPEN
+    assert record.threads[0].verdict_reason == "LLM investigator: diff does not address the reviewed workflow concern"
 
 
 def test_poll_marks_ready_when_no_codex_threads_and_old_pr_with_no_ci(store: StateStore) -> None:
