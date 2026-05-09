@@ -20,9 +20,13 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Iterator
+from typing import TYPE_CHECKING, Iterator
 
 from .models import BoxMiss, LedgerEntry, PollRecord, ThreadSnapshot
+
+if TYPE_CHECKING:
+    # Type-only import — runtime would cycle (swm.notify → swm.state for now_utc).
+    from .notify import NotificationRecord
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_STATE_DIR = REPO_ROOT / "state"
@@ -157,6 +161,14 @@ class StateStore:
             LedgerEntry.model_validate_json(line)
             for line in _read_jsonl(self._ledger_path(repo, pr))
         ]
+
+    # --- notifications (CHG-1112 positive transitions) ---------------------
+
+    def append_notification(self, note: "NotificationRecord") -> None:
+        """Append one positive-transition notification to notifications.jsonl."""
+        self.notifications_log.parent.mkdir(parents=True, exist_ok=True)
+        with self.notifications_log.open("a") as f:
+            f.write(note.model_dump_json() + "\n")
 
     # --- box misses (CHG-1105 classifier blind-spot visibility) -------------
 
