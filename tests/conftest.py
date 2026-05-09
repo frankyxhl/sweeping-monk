@@ -135,6 +135,7 @@ class FakeGhClient(GhClient):
                  pr_body_reactions: dict[int, list[dict]] | None = None,
                  active_login: str = "ryosaeba1985",
                  pr_bodies: dict[int, str] | None = None,
+                 pr_diffs: dict[int, str] | None = None,
                  review_should_fail: bool = False,
                  edit_should_fail: bool = False) -> None:
         # Skip parent __init__ — we override every public method.
@@ -144,6 +145,7 @@ class FakeGhClient(GhClient):
         self._pr_body_reactions = pr_body_reactions or {}
         self._active_login = active_login
         self._pr_bodies = pr_bodies or {}
+        self._pr_diffs = pr_diffs or {}
         self._review_should_fail = review_should_fail
         self._edit_should_fail = edit_should_fail
         self.calls: list[tuple[str, tuple, dict]] = []
@@ -170,6 +172,26 @@ class FakeGhClient(GhClient):
         self._record("issues_comments", repo, pr)
         return []
 
+    def create_issue_comment(self, repo: str, issue_number: int, body: str) -> dict:
+        self._record("create_issue_comment", repo, issue_number, body=body)
+        return {"id": issue_number + 1000, "body": body, "html_url": f"https://github.test/{issue_number}#comment"}
+
+    def reply_to_review_comment(self, repo: str, pr: int, comment_id: int, body: str) -> dict:
+        self._record("reply_to_review_comment", repo, pr, comment_id, body=body)
+        return {"id": comment_id + 1, "body": body}
+
+    @property
+    def actor_login(self) -> str | None:
+        return self._active_login
+
+    def set_review_comment_reaction(self, repo: str, comment_id: int, content: str) -> dict:
+        self._record("set_review_comment_reaction", repo, comment_id, content)
+        return {"content": content, "added": {"content": content}, "removed": []}
+
+    def pr_diff(self, repo: str, pr: int) -> str:
+        self._record("pr_diff", repo, pr)
+        return self._pr_diffs.get(pr, "")
+
     def branch_protection(self, repo: str, branch: str) -> dict | None:
         self._record("branch_protection", repo, branch)
         return self._branch_protection
@@ -194,8 +216,8 @@ class FakeGhClient(GhClient):
         self._record("auth_active_login")
         return self._active_login
 
-    def submit_review_approve(self, repo: str, pr: int, body: str) -> dict:
-        self._record("submit_review_approve", repo, pr, body=body)
+    def submit_review_approve(self, repo: str, pr: int, body: str, *, commit_id: str | None = None) -> dict:
+        self._record("submit_review_approve", repo, pr, body=body, commit_id=commit_id)
         if self._review_should_fail:
             from swm.gh import GhCommandError
             raise GhCommandError("simulated review failure")

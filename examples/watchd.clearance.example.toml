@@ -1,0 +1,23 @@
+# Copy to ~/.config/swm/watchd.toml on Wukong/Mac mini and fill real values.
+# Keep the private key outside the repository.
+state_dir = "/Users/frank/Projects/sweeping-monk/state"
+
+[server]
+host = "127.0.0.1"
+port = 8787
+path = "/github/webhook"
+webhook_secret_env = "SWM_WEBHOOK_SECRET"
+
+[actors.clearance]
+app_id = 123456
+installation_id = 78901234
+private_key_path = "/Users/frank/.config/swm/apps/iterwheel-clearance.private-key.pem"
+bot_login = "iterwheel-clearance[bot]"
+
+[[watch]]
+repo = "frankyxhl/alfred"
+base = "main"
+actor = "clearance"
+auto_resolve = true
+auto_approve = true
+auto_merge = false

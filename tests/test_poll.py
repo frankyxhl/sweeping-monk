@@ -5,6 +5,7 @@ from datetime import datetime, timedelta, timezone
 
 import pytest
 
+from swm.investigator import InvestigationDecision
 from swm.models import Status, Verdict
 from swm.poll import poll, poll_pr
 from swm.state import StateStore
@@ -55,6 +56,16 @@ def _codex_thread(*, thread_id: str = "T1", isOutdated: bool = False, isResolved
         "line": 31,
         "comments": {"nodes": comments},
     }
+
+
+class FakeInvestigator:
+    def __init__(self, decision: InvestigationDecision):
+        self.decision = decision
+        self.inputs = []
+
+    def investigate(self, item):
+        self.inputs.append(item)
+        return self.decision
 
 
 def test_poll_writes_one_record_per_open_pr(store: StateStore) -> None:
@@ -164,6 +175,54 @@ def test_poll_marks_ready_when_all_threads_resolved_and_ci_green(store: StateSto
     record = outcomes[0].record
     assert record.status is Status.READY
     assert record.threads[0].verdict is Verdict.RESOLVED
+
+
+def test_poll_investigator_can_resolve_replied_thread(store: StateStore) -> None:
+    investigator = FakeInvestigator(
+        InvestigationDecision(
+            verdict="RESOLVED",
+            confidence=0.92,
+            reason="diff removes the reviewed token logging",
+            evidence=["print(token) was removed"],
+        )
+    )
+    gh = FakeGhClient(
+        prs=[_pr_summary(ci=[{"name": "ci", "conclusion": "SUCCESS"}])],
+        review_threads={49: [_codex_thread(body="**P3** token logging concern", reply_body="Fixed it.")]},
+        pr_diffs={49: "diff --git a/app.py b/app.py\n- print(token)\n+ logger.info('ok')\n"},
+    )
+
+    outcomes = poll("owner/repo", store=store, gh_client=gh, investigator=investigator)
+
+    record = outcomes[0].record
+    assert record.status is Status.READY
+    assert record.threads[0].verdict is Verdict.RESOLVED
+    assert record.threads[0].llm_verdict == "RESOLVED"
+    assert record.threads[0].llm_confidence == 0.92
+    assert investigator.inputs[0].diff_excerpt.startswith("diff --git")
+
+
+def test_poll_investigator_can_keep_outdated_thread_open(store: StateStore) -> None:
+    investigator = FakeInvestigator(
+        InvestigationDecision(
+            verdict="OPEN",
+            confidence=0.88,
+            reason="diff does not address the reviewed workflow concern",
+            evidence=["only README changed"],
+        )
+    )
+    gh = FakeGhClient(
+        prs=[_pr_summary(ci=[{"name": "ci", "conclusion": "SUCCESS"}])],
+        review_threads={49: [_codex_thread(isOutdated=True, body="**P3** workflow concern")]},
+        pr_diffs={49: "diff --git a/README.md b/README.md\n+ docs only\n"},
+    )
+
+    outcomes = poll("owner/repo", store=store, gh_client=gh, investigator=investigator)
+
+    record = outcomes[0].record
+    assert record.status is Status.PENDING
+    assert record.threads[0].verdict is Verdict.OPEN
+    assert record.threads[0].verdict_reason == "LLM investigator: diff does not address the reviewed workflow concern"
 
 
 def test_poll_marks_ready_when_no_codex_threads_and_old_pr_with_no_ci(store: StateStore) -> None:
@@ -549,3 +608,92 @@ def test_swm_poll_emits_at_most_one_notify_line_per_invocation(
         f"{result_no_change.stdout}"
     )
     assert "no change:" in result_no_change.stdout
+
+
+def test_poll_investigator_falls_back_on_subprocess_timeout(store: StateStore) -> None:
+    """subprocess.TimeoutExpired must be caught and treated as an investigation error,
+    not propagate and abort the poll."""
+    import subprocess as _subprocess
+    from swm.investigator import InvestigationError
+
+    class TimeoutInvestigator:
+        def investigate(self, item):
+            raise _subprocess.TimeoutExpired(cmd="openclawcli", timeout=30)
+
+    gh = FakeGhClient(
+        prs=[_pr_summary()],
+        review_threads={49: [_codex_thread(thread_id="PRRT_timeout")]},
+    )
+
+    outcomes = poll("owner/repo", store=store, gh_client=gh, investigator=TimeoutInvestigator())
+
+    record = outcomes[0].record
+    # Poll must complete (not raise); deterministic heuristic takes over.
+    assert record is not None
+    thread = record.threads[0]
+    assert thread.llm_verdict is None
+    assert thread.llm_reason is None
+
+def test_poll_continues_when_diff_fetch_fails(store: StateStore) -> None:
+    """A GhCommandError from pr_diff must not abort the poll; llm_error records the failure."""
+    from swm.gh import GhCommandError
+    from swm.investigator import InvestigationDecision
+
+    class AlwaysResolveInvestigator:
+        def investigate(self, item):
+            return InvestigationDecision(verdict="RESOLVED", confidence=0.9, reason="ok", evidence=[])
+
+    class DiffFailingGh(FakeGhClient):
+        def pr_diff(self, repo, pr):
+            raise GhCommandError("simulated diff fetch failure")
+
+    gh = DiffFailingGh(
+        prs=[_pr_summary()],
+        review_threads={49: [_codex_thread(thread_id="PRRT_diff_fail", isOutdated=False)]},
+    )
+
+    outcomes = poll("owner/repo", store=store, gh_client=gh, investigator=AlwaysResolveInvestigator())
+
+    record = outcomes[0].record
+    assert record is not None, "poll must not abort on diff fetch failure"
+    # Evidence must record the diff error so it is auditable.
+    snap = store.read_thread("owner/repo", 49, "PRRT_diff_fail")
+    assert snap is not None
+    assert snap.evidence is not None
+    assert snap.evidence.llm_error is not None
+    assert "diff fetch failed" in snap.evidence.llm_error
+
+
+def test_poll_skips_llm_when_diff_fetch_fails(store: StateStore) -> None:
+    """When pr_diff raises, the investigator must not be called — the model
+    would receive an empty diff and could return RESOLVED on thin evidence,
+    potentially closing threads and making the PR ready incorrectly."""
+    from swm.gh import GhCommandError
+    from swm.investigator import InvestigationDecision
+
+    investigate_calls: list[int] = []
+
+    class TrackingInvestigator:
+        def investigate(self, item):
+            investigate_calls.append(1)
+            return InvestigationDecision(verdict="RESOLVED", confidence=0.9, reason="ok", evidence=[])
+
+    class DiffFailingGh(FakeGhClient):
+        def pr_diff(self, repo, pr):
+            raise GhCommandError("simulated diff fetch failure")
+
+    gh = DiffFailingGh(
+        prs=[_pr_summary()],
+        review_threads={49: [_codex_thread(thread_id="PRRT_skip_llm", isOutdated=False)]},
+    )
+
+    outcomes = poll("owner/repo", store=store, gh_client=gh, investigator=TrackingInvestigator())
+
+    assert len(investigate_calls) == 0, (
+        "investigator.investigate() must not be called when diff fetch fails; "
+        f"was called {len(investigate_calls)} time(s)"
+    )
+    # Thread verdict must come from deterministic heuristic, not LLM.
+    snap = store.read_thread("owner/repo", 49, "PRRT_skip_llm")
+    assert snap is not None and snap.evidence is not None
+    assert snap.evidence.llm_evidence is None or snap.evidence.llm_evidence == []

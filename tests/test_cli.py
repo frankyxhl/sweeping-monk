@@ -1,6 +1,9 @@
 """Unit tests for the typer CLI — uses CliRunner against a tmp state dir."""
 from __future__ import annotations
 
+from pathlib import Path
+from types import SimpleNamespace
+
 from typer.testing import CliRunner
 
 from swm.cli import app
@@ -15,6 +18,43 @@ def _seed(store: StateStore, polls: list[PollRecord], snapshots: list[ThreadSnap
         store.append_poll(p)
     for s in snapshots or []:
         store.write_thread(s)
+
+
+def _open_pr(number: int, *, head: str | None = None, base: str = "main") -> dict:
+    return {
+        "number": number,
+        "title": f"demo #{number}",
+        "headRefOid": head or (f"head{number}" + "0" * 34),
+        "baseRefName": base,
+        "isDraft": False,
+        "mergeStateStatus": "CLEAN",
+        "statusCheckRollup": [{"name": "ci", "conclusion": "SUCCESS"}],
+        "updatedAt": "2026-05-07T12:00:00Z",
+    }
+
+
+def _codex_review_thread(
+    thread_id: str,
+    *,
+    is_outdated: bool = True,
+    is_resolved: bool = False,
+) -> dict:
+    return {
+        "id": thread_id,
+        "isResolved": is_resolved,
+        "isOutdated": is_outdated,
+        "path": "app.py",
+        "line": 12,
+        "comments": {
+            "nodes": [{
+                "databaseId": 1001,
+                "author": {"login": "chatgpt-codex-connector"},
+                "body": "**P3** stale docs concern",
+                "createdAt": "2026-05-07T12:00:00Z",
+                "replyTo": None,
+            }],
+        },
+    }
 
 
 def test_dashboard_command_renders_panel(
@@ -133,6 +173,514 @@ def test_poll_command_says_no_open_prs_when_repo_is_empty(
     # Assert
     assert result.exit_code == 0
     assert "no open PRs" in result.stdout
+
+
+def test_close_items_command_resolves_only_target_pr(store: StateStore, monkeypatch) -> None:
+    from tests.conftest import FakeGhClient
+    from swm.investigator import InvestigationDecision
+
+    class FakeInvestigator:
+        def investigate(self, item):
+            return InvestigationDecision(
+                verdict="RESOLVED",
+                confidence=0.91,
+                reason="the current diff removes the stale threshold guidance",
+                evidence=["the diff no longer includes the fewer-than-3-round skip rule"],
+            )
+
+    fake = FakeGhClient(
+        prs=[_open_pr(49), _open_pr(50)],
+        review_threads={
+            49: [_codex_review_thread("PRRT_49")],
+            50: [_codex_review_thread("PRRT_50")],
+        },
+    )
+    monkeypatch.setattr("swm.cli.GhClient", lambda: fake)
+    monkeypatch.setattr("swm.cli.build_investigator_from_env", lambda: FakeInvestigator())
+
+    result = runner.invoke(app, [
+        "close-items", "owner/repo", "49",
+        "--yes",
+        "--state-dir", str(store.directory),
+    ])
+
+    assert result.exit_code == 0, result.stdout
+    write_calls = [
+        call for call in fake.calls
+        if call[0] in {
+            "set_review_comment_reaction",
+            "reply_to_review_comment",
+            "resolve_thread",
+            "create_issue_comment",
+        }
+    ]
+    assert [call[0] for call in write_calls] == [
+        "set_review_comment_reaction",
+        "reply_to_review_comment",
+        "resolve_thread",
+        "create_issue_comment",
+    ]
+    assert write_calls[0] == ("set_review_comment_reaction", ("owner/repo", 1001, "+1"), {})
+    reply = write_calls[1]
+    assert reply[1][:3] == ("owner/repo", 49, 1001)
+    reply_body = reply[2]["body"]
+    assert "OpenClaw Flash" in reply_body
+    assert "the current diff removes the stale threshold guidance" in reply_body
+    assert "fewer-than-3-round skip rule" in reply_body
+    assert write_calls[2] == ("resolve_thread", ("PRRT_49",), {})
+    run_comment = write_calls[3]
+    assert run_comment[1][:2] == ("owner/repo", 49)
+    assert "Clearance run conclusion" in run_comment[2]["body"]
+    assert "Closed this run: `1`" in run_comment[2]["body"]
+    record = store.latest_poll("owner/repo", 49)
+    assert record is not None
+    assert record.trigger == "manual-close-items+stage1.5-sync"
+    assert record.stage15_actions[0].threadId == "PRRT_49"
+    assert record.stage15_actions[0].result["close_reason_comment"]["id"] == 1002
+    assert store.latest_poll("owner/repo", 50) is None
+
+
+def test_close_items_command_reports_when_nothing_is_closable(store: StateStore, monkeypatch) -> None:
+    from tests.conftest import FakeGhClient
+
+    fake = FakeGhClient(
+        prs=[_open_pr(49)],
+        review_threads={49: [_codex_review_thread("PRRT_49", is_resolved=True)]},
+    )
+    monkeypatch.setattr("swm.cli.GhClient", lambda: fake)
+
+    result = runner.invoke(app, [
+        "close-items", "owner/repo", "49",
+        "--yes",
+        "--state-dir", str(store.directory),
+    ])
+
+    assert result.exit_code == 0, result.stdout
+    assert "no open review items" in result.stdout
+    assert [call for call in fake.calls if call[0] == "resolve_thread"] == []
+    comment_calls = [call for call in fake.calls if call[0] == "create_issue_comment"]
+    assert len(comment_calls) == 1
+    assert "Closed this run: `0`" in comment_calls[0][2]["body"]
+    record = store.latest_poll("owner/repo", 49)
+    assert record is not None
+    assert record.trigger == "manual-close-items"
+
+
+def test_close_items_command_can_use_configured_github_app_actor(store: StateStore, monkeypatch) -> None:
+    from tests.conftest import FakeGhClient
+    from swm.investigator import InvestigationDecision
+
+    class FakeInvestigator:
+        def investigate(self, item):
+            return InvestigationDecision(
+                verdict="RESOLVED",
+                confidence=0.93,
+                reason="verified by app actor test",
+                evidence=["evidence from the current diff"],
+            )
+
+    class FakeTokenProvider:
+        def token_for(self, **kwargs):
+            captured["token_kwargs"] = kwargs
+            return "installation-token"
+
+    fake = FakeGhClient(
+        prs=[_open_pr(49)],
+        review_threads={49: [_codex_review_thread("PRRT_49")]},
+    )
+    captured = {}
+
+    def fake_load_config(path):
+        captured["config_path"] = path
+        actor = SimpleNamespace(
+            app_id=123,
+            installation_id=456,
+            private_key_path=Path("/tmp/clearance.pem"),
+            bot_login="iterwheel-clearance[bot]",
+            api_url="https://api.github.com",
+        )
+        return SimpleNamespace(actor=lambda name: actor)
+
+    def fake_gh_client(*args, **kwargs):
+        captured["gh_kwargs"] = kwargs
+        return fake
+
+    monkeypatch.setattr("swm.cli.load_config", fake_load_config)
+    monkeypatch.setattr("swm.cli.InstallationTokenProvider", FakeTokenProvider)
+    monkeypatch.setattr("swm.cli.GhClient", fake_gh_client)
+    monkeypatch.setattr("swm.cli.build_investigator_from_env", lambda: FakeInvestigator())
+
+    result = runner.invoke(app, [
+        "close-items", "owner/repo", "49",
+        "--actor", "clearance",
+        "--config", "/tmp/watchd.toml",
+        "--yes",
+        "--state-dir", str(store.directory),
+    ])
+
+    assert result.exit_code == 0, result.stdout
+    assert captured["config_path"] == "/tmp/watchd.toml"
+    assert captured["token_kwargs"]["app_id"] == 123
+    assert captured["token_kwargs"]["installation_id"] == 456
+    assert captured["gh_kwargs"] == {
+        "token": "installation-token",
+        "actor_login": "iterwheel-clearance[bot]",
+    }
+    assert [call[0] for call in fake.calls if call[0] in {
+        "set_review_comment_reaction",
+        "reply_to_review_comment",
+        "resolve_thread",
+        "create_issue_comment",
+    }] == [
+        "set_review_comment_reaction",
+        "reply_to_review_comment",
+        "resolve_thread",
+        "create_issue_comment",
+    ]
+
+
+def test_close_items_command_marks_unresolved_items_without_resolving(store: StateStore, monkeypatch) -> None:
+    from tests.conftest import FakeGhClient
+
+    fake = FakeGhClient(
+        prs=[_open_pr(49)],
+        review_threads={49: [_codex_review_thread("PRRT_49", is_outdated=False)]},
+    )
+    monkeypatch.setattr("swm.cli.GhClient", lambda: fake)
+
+    result = runner.invoke(app, [
+        "close-items", "owner/repo", "49",
+        "--yes",
+        "--state-dir", str(store.directory),
+    ])
+
+    assert result.exit_code == 0, result.stdout
+    write_calls = [
+        call for call in fake.calls
+        if call[0] in {
+            "set_review_comment_reaction",
+            "reply_to_review_comment",
+            "resolve_thread",
+            "create_issue_comment",
+        }
+    ]
+    assert [call[0] for call in write_calls] == [
+        "set_review_comment_reaction",
+        "reply_to_review_comment",
+        "create_issue_comment",
+    ]
+    assert write_calls[0] == ("set_review_comment_reaction", ("owner/repo", 1001, "-1"), {})
+    reply_body = write_calls[1][2]["body"]
+    assert "Verdict: `OPEN`" in reply_body
+    assert "left open" in reply_body
+    assert "Closed this run: `0`" in write_calls[2][2]["body"]
+
+
+def test_close_items_aborts_when_head_drifts_after_confirmation(store: StateStore, monkeypatch) -> None:
+    """TOCTOU guard: close-items must re-read head SHA after confirmation and abort on drift."""
+    from tests.conftest import FakeGhClient
+    from swm.investigator import InvestigationDecision
+
+    class FakeInvestigator:
+        def investigate(self, item):
+            return InvestigationDecision(verdict="RESOLVED", confidence=0.9, reason="ok", evidence=[])
+
+    class DriftingGh(FakeGhClient):
+        def view_pr(self, repo, pr, fields):
+            self._record("view_pr", repo, pr, fields=fields)
+            view_calls = sum(1 for c in self.calls if c[0] == "view_pr")
+            # close-items issues exactly one view_pr (the TOCTOU recheck); drift on it.
+            if view_calls >= 1 and "headRefOid" in fields:
+                return {**next(p for p in self._prs if p["number"] == pr), "headRefOid": "drifted99" + "0" * 31}
+            return next(p for p in self._prs if p["number"] == pr)
+
+    fake = DriftingGh(
+        prs=[_open_pr(49)],
+        review_threads={49: [_codex_review_thread("PRRT_49")]},
+    )
+    monkeypatch.setattr("swm.cli.GhClient", lambda: fake)
+    monkeypatch.setattr("swm.cli.build_investigator_from_env", lambda: FakeInvestigator())
+
+    result = runner.invoke(app, [
+        "close-items", "owner/repo", "49", "--yes",
+        "--state-dir", str(store.directory),
+    ])
+
+    assert result.exit_code == 1
+    assert "head changed since poll" in result.stdout or "re-run close-items" in result.stdout
+    write_calls = [c for c in fake.calls if c[0] in {"set_review_comment_reaction", "resolve_thread"}]
+    assert write_calls == [], "no writebacks should occur when head drifts"
+
+
+def test_close_items_require_flash_preflights_all_threads_before_any_mutation(store: StateStore, monkeypatch) -> None:
+    """--require-flash must validate ALL threads before any write; no partial mutation."""
+    from tests.conftest import FakeGhClient
+
+    threads = [
+        _codex_review_thread("PRRT_A"),
+        _codex_review_thread("PRRT_B"),
+    ]
+    fake = FakeGhClient(prs=[_open_pr(49)], review_threads={49: threads})
+    monkeypatch.setattr("swm.cli.GhClient", lambda: fake)
+    monkeypatch.setattr("swm.cli.build_investigator_from_env", lambda: None)
+
+    result = runner.invoke(app, [
+        "close-items", "owner/repo", "49",
+        "--require-flash", "--yes",
+        "--state-dir", str(store.directory),
+    ])
+
+    assert result.exit_code == 1
+    assert "no Flash investigator reason" in result.stdout or "refusing to close" in result.stdout
+    write_calls = [c for c in fake.calls if c[0] in {"set_review_comment_reaction", "reply_to_review_comment", "resolve_thread"}]
+    assert write_calls == [], "no mutations must fire before preflight completes"
+
+
+def test_close_items_captures_partial_actions_when_second_resolve_fails(store: StateStore, monkeypatch) -> None:
+    """actions list must contain the first resolve even when the second resolve raises —
+    so the audit comment says 'Closed this run: 1', not '0'."""
+    from tests.conftest import FakeGhClient
+    from swm.gh import GhCommandError
+    from swm.investigator import InvestigationDecision
+
+    class FakeInvestigator:
+        def investigate(self, item):
+            return InvestigationDecision(verdict="RESOLVED", confidence=0.9, reason="ok", evidence=[])
+
+    resolve_call_count = 0
+
+    class PartialResolveGh(FakeGhClient):
+        def resolve_thread(self, thread_id):
+            nonlocal resolve_call_count
+            resolve_call_count += 1
+            self._record("resolve_thread", thread_id)
+            if resolve_call_count >= 2:
+                raise GhCommandError("simulated second resolve failure")
+            return {"resolvedBy": {"login": "iterwheel-clearance[bot]"}}
+
+    threads = [
+        _codex_review_thread("PRRT_A"),
+        _codex_review_thread("PRRT_B"),
+    ]
+    fake = PartialResolveGh(prs=[_open_pr(49)], review_threads={49: threads})
+    monkeypatch.setattr("swm.cli.GhClient", lambda: fake)
+    monkeypatch.setattr("swm.cli.build_investigator_from_env", lambda: FakeInvestigator())
+
+    result = runner.invoke(app, [
+        "close-items", "owner/repo", "49", "--yes",
+        "--state-dir", str(store.directory),
+    ])
+
+    assert result.exit_code == 1
+    run_comment_calls = [c for c in fake.calls if c[0] == "create_issue_comment"]
+    assert run_comment_calls, "error audit comment must be posted"
+    audit_body = run_comment_calls[0][2]["body"]
+    assert "Closed this run: `1`" in audit_body, \
+        f"expected 'Closed this run: 1' in audit comment, got: {audit_body!r}"
+
+
+def test_close_items_re_polls_after_confirmation_to_get_fresh_verdicts(store: StateStore, monkeypatch) -> None:
+    """After confirmation, close-items must re-poll so thread state that changed
+    during the confirmation prompt is not written back with a stale verdict."""
+    from tests.conftest import FakeGhClient
+    from swm.investigator import InvestigationDecision
+
+    poll_count = 0
+
+    class CountingGh(FakeGhClient):
+        def review_threads(self, repo, pr):
+            nonlocal poll_count
+            poll_count += 1
+            return super().review_threads(repo, pr)
+
+    fake = CountingGh(
+        prs=[_open_pr(49)],
+        review_threads={49: [_codex_review_thread("PRRT_A")]},
+    )
+    monkeypatch.setattr("swm.cli.GhClient", lambda: fake)
+    monkeypatch.setattr("swm.cli.build_investigator_from_env", lambda: None)
+
+    runner.invoke(app, [
+        "close-items", "owner/repo", "49", "--yes",
+        "--state-dir", str(store.directory),
+    ])
+
+    assert poll_count >= 2, (
+        "close-items must re-fetch review threads after confirmation "
+        f"(review_threads called {poll_count} time(s), expected ≥2)"
+    )
+
+
+def test_close_items_aborts_when_thread_state_drifts_after_confirmation(store: StateStore, monkeypatch) -> None:
+    """If a thread's verdict changes between confirmation and re-poll (e.g. a new
+    author reply lands during the confirmation prompt), close-items must abort
+    rather than silently act on a different plan than the operator confirmed."""
+    from tests.conftest import FakeGhClient
+    from swm.investigator import InvestigationDecision
+
+    class FakeInvestigator:
+        def investigate(self, item):
+            return InvestigationDecision(verdict="RESOLVED", confidence=0.9, reason="ok", evidence=[])
+
+    poll_call_count = 0
+
+    class DriftingThreadsGh(FakeGhClient):
+        def review_threads(self, repo, pr):
+            nonlocal poll_call_count
+            poll_call_count += 1
+            if poll_call_count == 1:
+                # First poll (pre-confirmation): one RESOLVED thread shown in plan.
+                return [_codex_review_thread("PRRT_A", is_outdated=True)]
+            # Re-poll (post-confirmation): thread is now also resolved by a
+            # second thread arriving, changing the closable set.
+            return [
+                _codex_review_thread("PRRT_A", is_outdated=True),
+                _codex_review_thread("PRRT_B", is_outdated=True),
+            ]
+
+    fake = DriftingThreadsGh(prs=[_open_pr(49)], review_threads={49: []})
+    monkeypatch.setattr("swm.cli.GhClient", lambda: fake)
+    monkeypatch.setattr("swm.cli.build_investigator_from_env", lambda: FakeInvestigator())
+
+    result = runner.invoke(app, [
+        "close-items", "owner/repo", "49", "--yes",
+        "--state-dir", str(store.directory),
+    ])
+
+    assert result.exit_code == 1
+    assert "Thread state changed" in result.stdout or "re-run close-items" in result.stdout
+    write_calls = [c for c in fake.calls if c[0] in {"reply_to_review_comment", "resolve_thread", "set_review_comment_reaction"}]
+    assert write_calls == [], f"no writebacks expected after drift abort, got: {write_calls}"
+
+
+def test_close_items_aborts_when_head_drifts_during_repoll(store: StateStore, monkeypatch) -> None:
+    """Head drift that occurs DURING the post-confirmation re-poll (after the
+    TOCTOU check passes but while poll_pr() is running with a stale pr_summary)
+    must be caught by the second view_pr call and abort without any writes."""
+    from tests.conftest import FakeGhClient
+    from swm.investigator import InvestigationDecision
+
+    class FakeInvestigator:
+        def investigate(self, item):
+            return InvestigationDecision(verdict="RESOLVED", confidence=0.9, reason="ok", evidence=[])
+
+    class LateRepollDriftGh(FakeGhClient):
+        def view_pr(self, repo, pr, fields):
+            self._record("view_pr", repo, pr, fields=fields)
+            # Count only view_pr calls that include headRefOid (including this one,
+            # since _record was already called above).
+            headref_calls = sum(
+                1 for c in self.calls
+                if c[0] == "view_pr" and "headRefOid" in c[2].get("fields", [])
+            )
+            if headref_calls >= 2 and "headRefOid" in fields:
+                # Post-repoll check: return a drifted head.
+                pr_data = next(p for p in self._prs if p["number"] == pr)
+                return {**pr_data, "headRefOid": "latdrift0" + "0" * 31}
+            return next(p for p in self._prs if p["number"] == pr)
+
+    fake = LateRepollDriftGh(
+        prs=[_open_pr(49)],
+        review_threads={49: [_codex_review_thread("PRRT_49")]},
+    )
+    monkeypatch.setattr("swm.cli.GhClient", lambda: fake)
+    monkeypatch.setattr("swm.cli.build_investigator_from_env", lambda: FakeInvestigator())
+
+    result = runner.invoke(app, [
+        "close-items", "owner/repo", "49", "--yes",
+        "--state-dir", str(store.directory),
+    ])
+
+    assert result.exit_code == 1
+    assert "head changed during re-poll" in result.stdout or "re-run close-items" in result.stdout
+    write_calls = [c for c in fake.calls if c[0] in {"set_review_comment_reaction", "resolve_thread", "reply_to_review_comment"}]
+    assert write_calls == [], f"no writes expected when head drifts during re-poll, got: {write_calls}"
+
+
+def test_close_items_aborts_on_verdict_change_without_id_change(store: StateStore, monkeypatch) -> None:
+    """Drift detection must fire when a thread's verdict changes (e.g. OPEN →
+    NEEDS_HUMAN_JUDGMENT) even when the thread IDs are unchanged — catches the
+    case where confirmed_open_ids matched but the displayed reason was stale."""
+    from tests.conftest import FakeGhClient
+    from swm.investigator import InvestigationDecision
+
+    poll_call_count = 0
+
+    class VerdictDriftGh(FakeGhClient):
+        def review_threads(self, repo, pr):
+            nonlocal poll_call_count
+            poll_call_count += 1
+            # Both polls return the same thread ID; only the first is used for the
+            # pre-confirmation display. The investigator returns RESOLVED on call 1
+            # (so the plan shows RESOLVED) but the re-poll sees the thread as
+            # non-outdated (no author reply yet), so the investigator now returns
+            # NEEDS_HUMAN_JUDGMENT — same ID, different verdict.
+            if poll_call_count == 1:
+                return [_codex_review_thread("PRRT_X", is_outdated=True)]
+            # Re-poll: thread is no longer outdated (anchor moved) — classifies
+            # differently and the investigator verdict changes.
+            return [_codex_review_thread("PRRT_X", is_outdated=False)]
+
+    verdict_call = [0]
+
+    class FlipInvestigator:
+        def investigate(self, item):
+            verdict_call[0] += 1
+            if verdict_call[0] == 1:
+                return InvestigationDecision(verdict="RESOLVED", confidence=0.9, reason="ok", evidence=[])
+            return InvestigationDecision(verdict="NEEDS_HUMAN_JUDGMENT", confidence=0.4, reason="unclear", evidence=[])
+
+    fake = VerdictDriftGh(prs=[_open_pr(49)], review_threads={49: []})
+    monkeypatch.setattr("swm.cli.GhClient", lambda: fake)
+    monkeypatch.setattr("swm.cli.build_investigator_from_env", lambda: FlipInvestigator())
+
+    result = runner.invoke(app, [
+        "close-items", "owner/repo", "49", "--yes",
+        "--state-dir", str(store.directory),
+    ])
+
+    assert result.exit_code == 1
+    assert "Thread state changed" in result.stdout or "re-run close-items" in result.stdout
+    write_calls = [c for c in fake.calls if c[0] in {"reply_to_review_comment", "resolve_thread"}]
+    assert write_calls == [], f"no writebacks expected after verdict drift, got: {write_calls}"
+
+
+def _make_thread(thread_id: str, verdict) -> "Thread":
+    from swm.models import Thread, Severity
+    return Thread(
+        id=thread_id,
+        comment_id=42,
+        path="src/foo.py",
+        line=10,
+        codex_severity=Severity.P3,
+        effective_severity=Severity.P3,
+        verdict=verdict,
+        verdict_reason="test",
+    )
+
+
+def test_existing_conclusion_markers_resolved_returns_only_close_reason() -> None:
+    """For a RESOLVED thread, existing_conclusion_markers must only return the
+    swm-close-reason marker — a stale swm-thread-conclusion must not satisfy the
+    pre-resolve check (it carries a 'left open' public message)."""
+    from swm.close_reason import existing_conclusion_markers
+    from swm.models import Verdict
+
+    thread = _make_thread("PRRT_abc", Verdict.RESOLVED)
+    markers = existing_conclusion_markers(thread, head_sha="deadbeef1234abcd")
+    assert markers == [f"swm-close-reason:{thread.id}:deadbeef1234"]
+    assert not any("swm-thread-conclusion" in m for m in markers)
+
+
+def test_existing_conclusion_markers_open_returns_only_conclusion() -> None:
+    """For a non-RESOLVED thread, only the swm-thread-conclusion marker is returned."""
+    from swm.close_reason import existing_conclusion_markers
+    from swm.models import Verdict
+
+    thread = _make_thread("PRRT_xyz", Verdict.NEEDS_HUMAN_JUDGMENT)
+    markers = existing_conclusion_markers(thread, head_sha="cafebabe5678abcd")
+    assert markers == [f"swm-thread-conclusion:{thread.id}:cafebabe5678"]
+    assert not any("swm-close-reason" in m for m in markers)
 
 
 # --- SWM-1104 guarded subcommand tests --------------------------------------

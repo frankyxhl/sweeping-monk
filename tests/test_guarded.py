@@ -15,6 +15,7 @@ from swm.guarded import (
     check_identity,
     check_verdict,
     classify_box,
+    parse_checkboxes,
     parse_unchecked_boxes,
     render_approve_body,
 )
@@ -124,6 +125,14 @@ def test_parse_unchecked_boxes_skips_checked_lines():
     boxes = parse_unchecked_boxes(SAMPLE_BODY)
     assert [b.line_number for b in boxes] == [4, 5, 6, 7, 8]
     assert not any("parser written" in b.text for b in boxes)  # the [x] line is excluded
+
+
+def test_parse_checkboxes_records_checked_state():
+    boxes = parse_checkboxes(SAMPLE_BODY)
+    assert [b.line_number for b in boxes] == [3, 4, 5, 6, 7, 8]
+    assert boxes[0].checked is True
+    assert boxes[1].checked is False
+    assert boxes[0].text == "**A1**: parser written"
 
 
 def test_parse_unchecked_boxes_handles_indented_lines():

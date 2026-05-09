@@ -20,6 +20,7 @@ from .models import BoxMiss, CIConclusion, LedgerEntry, PollRecord, Status
 from .state import StateStore, now_utc
 
 PREFERRED_AGENT_LOGIN = "ryosaeba1985"
+CHECKBOX_RE = re.compile(r"^(\s*)-\s+\[([ xX])\]\s+(.+)$")
 UNCHECKED_RE = re.compile(r"^(\s*)-\s+\[ \]\s+(.+)$")
 
 
@@ -112,7 +113,9 @@ def check_verdict(store: StateStore, repo: str, pr: int, current_head_sha: str) 
 # --- approve body template --------------------------------------------------
 
 
-def render_approve_body(poll: PollRecord, reason: str) -> str:
+def render_approve_body(
+    poll: PollRecord, reason: str, *, actor_label: str = "maintainer",
+) -> str:
     """Templated factual body — not free-form opinion. Stays Stage-3 acceptable."""
     ci_lines = []
     for runner, conclusion in sorted(poll.ci.items()):
@@ -121,7 +124,7 @@ def render_approve_body(poll: PollRecord, reason: str) -> str:
     ci_block = "\n".join(ci_lines) if ci_lines else "(no CI runs reported)"
     codex_signal = poll.codex_pr_body_signal or "no PR-body reaction"
     return (
-        f"Approved by maintainer. Reviewed via local watchdog (SWM-1103):\n"
+        f"Approved by {actor_label}. Reviewed via local watchdog (SWM-1103):\n"
         f"\n"
         f"- head: {poll.head_sha[:8]}\n"
         f"- CI:\n{ci_block}\n"
@@ -140,15 +143,27 @@ class CheckboxLine:
     raw: str
     text: str          # everything after "- [ ] "
     line_number: int   # 1-based, in the PR body
+    checked: bool = False
+
+
+def parse_checkboxes(body: str) -> list[CheckboxLine]:
+    out: list[CheckboxLine] = []
+    for i, line in enumerate(body.splitlines(), start=1):
+        m = CHECKBOX_RE.match(line)
+        if m:
+            out.append(
+                CheckboxLine(
+                    raw=line,
+                    text=m.group(3),
+                    line_number=i,
+                    checked=m.group(2).lower() == "x",
+                )
+            )
+    return out
 
 
 def parse_unchecked_boxes(body: str) -> list[CheckboxLine]:
-    out: list[CheckboxLine] = []
-    for i, line in enumerate(body.splitlines(), start=1):
-        m = UNCHECKED_RE.match(line)
-        if m:
-            out.append(CheckboxLine(raw=line, text=m.group(2), line_number=i))
-    return out
+    return [box for box in parse_checkboxes(body) if not box.checked]
 
 
 @dataclass

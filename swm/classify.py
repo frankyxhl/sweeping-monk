@@ -18,6 +18,7 @@ from typing import Literal
 
 CODEX_BOT_LOGIN = "chatgpt-codex-connector"  # GraphQL omits the [bot] suffix
 CODEX_BOT_LOGIN_REST = "chatgpt-codex-connector[bot]"  # REST API includes [bot] suffix
+SWM_MARKER_PREFIX = "<!-- swm-"  # prefix for all SWM-generated conclusion/close-reason markers
 ThreadState = Literal["A", "B", "C"]
 CodexBodySignal = Literal["reviewing", "approved"]
 
@@ -73,8 +74,12 @@ def author_replies(thread: dict) -> list[dict]:
 
 
 def latest_author_reply(thread: dict) -> dict | None:
-    """The most recent non-Codex reply, or None if there is no reply."""
-    replies = [c for c in author_replies(thread) if _login(c) != CODEX_BOT_LOGIN]
+    """The most recent non-Codex, non-SWM-marker reply, or None."""
+    replies = [
+        c for c in author_replies(thread)
+        if _login(c) != CODEX_BOT_LOGIN
+        and not (c.get("body") or "").startswith(SWM_MARKER_PREFIX)
+    ]
     return replies[-1] if replies else None
 
 

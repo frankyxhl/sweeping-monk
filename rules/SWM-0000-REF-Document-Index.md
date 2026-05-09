@@ -22,6 +22,7 @@
 | 1110 | CHG | Codex Re Review Trigger Implementation |
 | 1111 | CHG | OpenClaw State Change Decision Adapter |
 | 1112 | CHG | Notify On Ready Transition |
+| 1113 | CHG | Clearance Webhook Auto Approve |
 
 ---
 

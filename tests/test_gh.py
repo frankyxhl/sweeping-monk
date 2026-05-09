@@ -5,6 +5,7 @@ import json
 
 import pytest
 
+from swm import gh as gh_module
 from swm.gh import GhClient, GhCommandError, GhResult
 
 
@@ -78,6 +79,19 @@ def test_branch_protection_returns_none_on_404() -> None:
     assert client.branch_protection("owner/repo", "main") is None
 
 
+def test_branch_protection_returns_sentinel_when_app_token_cannot_read_protection() -> None:
+    # A 403 must NOT return None (which would set branch_protected=False).
+    # It must return a non-None sentinel so callers treat the branch as protected.
+    runner = StubRunner()
+    runner.expect(("api", "repos/owner/repo/branches/main/protection"),
+                  code=1, stderr="gh: Resource not accessible by integration (HTTP 403)")
+    client = GhClient(runner=runner)
+
+    result = client.branch_protection("owner/repo", "main")
+    assert result is not None
+    assert result.get("_unknown") is True
+
+
 def test_branch_protection_returns_dict_when_protected() -> None:
     # Arrange
     runner = StubRunner()
@@ -121,6 +135,79 @@ def test_review_threads_handles_missing_pr_key() -> None:
     assert client.review_threads("owner/repo", 99) == []
 
 
+def _no_overflow_comments(nodes: list[dict]) -> dict:
+    """Helper: comments connection with no further pages."""
+    return {"pageInfo": {"hasNextPage": False, "endCursor": None}, "nodes": nodes}
+
+
+def test_review_threads_paginates_when_has_next_page() -> None:
+    # Arrange — page 1 signals hasNextPage; page 2 has endCursor=null/no-next
+    page1 = {"data": {"repository": {"pullRequest": {"reviewThreads": {
+        "pageInfo": {"hasNextPage": True, "endCursor": "cursor-abc"},
+        "nodes": [{"id": "T1", "isResolved": False, "isOutdated": False, "comments": _no_overflow_comments([])}],
+    }}}}}
+    page2 = {"data": {"repository": {"pullRequest": {"reviewThreads": {
+        "pageInfo": {"hasNextPage": False, "endCursor": None},
+        "nodes": [{"id": "T2", "isResolved": True,  "isOutdated": False, "comments": _no_overflow_comments([])}],
+    }}}}}
+    responses: list[dict] = [page1, page2]
+    calls: list[list[str]] = []
+
+    def runner(args: list[str]) -> GhResult:
+        calls.append(args)
+        return GhResult(returncode=0, stdout=json.dumps(responses[len(calls) - 1]), stderr="")
+
+    client = GhClient(runner=runner)
+
+    # Act
+    threads = client.review_threads("owner/repo", 7)
+
+    # Assert — both pages collected, no comment overflow queries
+    assert [t["id"] for t in threads] == ["T1", "T2"]
+    assert len(calls) == 2
+    assert any("cursor=cursor-abc" in a for a in calls[1])
+
+
+def test_review_threads_paginates_nested_comments_when_thread_overflows() -> None:
+    # Arrange — single thread with comments.hasNextPage=true; one overflow page
+    c1 = {"databaseId": 1, "author": {"login": "codex"}, "body": "P2 issue", "createdAt": "2026-05-09T00:00:00Z", "replyTo": None}
+    c2 = {"databaseId": 2, "author": {"login": "human"}, "body": "fixed", "createdAt": "2026-05-09T01:00:00Z", "replyTo": {"databaseId": 1}}
+    overflow_comment = {"databaseId": 3, "author": {"login": "human"}, "body": "actually reverting", "createdAt": "2026-05-09T02:00:00Z", "replyTo": {"databaseId": 1}}
+
+    threads_response = {"data": {"repository": {"pullRequest": {"reviewThreads": {
+        "pageInfo": {"hasNextPage": False, "endCursor": None},
+        "nodes": [{"id": "PRRT_overflow", "isResolved": False, "isOutdated": False,
+                   "comments": {"pageInfo": {"hasNextPage": True, "endCursor": "cc1"}, "nodes": [c1, c2]}}],
+    }}}}}
+    overflow_response = {"data": {"node": {"comments": {
+        "pageInfo": {"hasNextPage": False, "endCursor": None},
+        "nodes": [overflow_comment],
+    }}}}
+
+    call_count = 0
+
+    def runner(args: list[str]) -> GhResult:
+        nonlocal call_count
+        call_count += 1
+        if call_count == 1:
+            return GhResult(0, json.dumps(threads_response), "")
+        # second call is the per-thread comment overflow query
+        assert any("threadId=PRRT_overflow" in a for a in args)
+        assert any("cursor=cc1" in a for a in args)
+        return GhResult(0, json.dumps(overflow_response), "")
+
+    client = GhClient(runner=runner)
+
+    # Act
+    threads = client.review_threads("owner/repo", 3)
+
+    # Assert — overflow comment appended; exactly 2 queries made
+    assert call_count == 2
+    assert len(threads) == 1
+    comment_ids = [c["databaseId"] for c in threads[0]["comments"]["nodes"]]
+    assert comment_ids == [1, 2, 3]
+
+
 def test_resolve_thread_unwraps_thread_payload() -> None:
     # Arrange
     payload = {"data": {"resolveReviewThread": {"thread": {"id": "T1", "isResolved": True, "resolvedBy": {"login": "tester"}}}}}
@@ -148,6 +235,91 @@ def test_unresolve_thread_unwraps_thread_payload() -> None:
 
     # Assert
     assert result["isResolved"] is False
+
+
+def test_reply_to_review_comment_uses_rest_payload_file() -> None:
+    runner = StubRunner()
+    runner.expect(
+        ("api", "repos/frankyxhl/alfred/pulls/122/comments/321/replies"),
+        stdout='{"id":654,"body":"ok"}',
+    )
+    gh = GhClient(runner=runner)
+
+    out = gh.reply_to_review_comment("frankyxhl/alfred", 122, 321, "Close reason with `quotes`.")
+
+    assert out["id"] == 654
+    submitted = runner.calls[-1]
+    assert submitted[:2] == ["api", "repos/frankyxhl/alfred/pulls/122/comments/321/replies"]
+    assert submitted[submitted.index("--method") + 1] == "POST"
+    payload_path = submitted[submitted.index("--input") + 1]
+    import os as _os
+    assert not _os.path.exists(payload_path), "payload tempfile must be cleaned up"
+
+
+def test_create_issue_comment_appends_new_timeline_comment() -> None:
+    runner = StubRunner()
+    runner.expect(
+        ("api", "repos/frankyxhl/alfred/issues/123/comments"),
+        stdout='{"id":777,"html_url":"https://github.test/comment"}',
+    )
+    gh = GhClient(runner=runner)
+
+    out = gh.create_issue_comment("frankyxhl/alfred", 123, "Clearance run conclusion")
+
+    assert out["id"] == 777
+    submitted = runner.calls[-1]
+    assert submitted[:2] == ["api", "repos/frankyxhl/alfred/issues/123/comments"]
+    assert submitted[submitted.index("--method") + 1] == "POST"
+    payload_path = submitted[submitted.index("--input") + 1]
+    import os as _os
+    assert not _os.path.exists(payload_path), "payload tempfile must be cleaned up"
+
+
+def test_set_review_comment_reaction_replaces_opposite_status() -> None:
+    runner = StubRunner()
+    runner.expect(
+        ("api", "repos/frankyxhl/alfred/pulls/comments/321/reactions?per_page=100&content=-1"),
+        stdout=json.dumps([{"id": 91, "content": "-1", "user": {"login": "iterwheel-clearance[bot]"}}]),
+    )
+    runner.expect(
+        ("api", "repos/frankyxhl/alfred/pulls/comments/321/reactions/91"),
+        stdout="",
+    )
+    runner.expect(
+        ("api", "repos/frankyxhl/alfred/pulls/comments/321/reactions?per_page=100&content=%2B1"),
+        stdout="[]",
+    )
+    runner.expect(
+        ("api", "repos/frankyxhl/alfred/pulls/comments/321/reactions"),
+        stdout=json.dumps({"id": 92, "content": "+1"}),
+    )
+    gh = GhClient(runner=runner, actor_login="iterwheel-clearance[bot]")
+
+    out = gh.set_review_comment_reaction("frankyxhl/alfred", 321, "+1")
+
+    assert out["content"] == "+1"
+    assert out["removed"][0]["id"] == 91
+    assert out["added"]["id"] == 92
+    delete_call = runner.calls[1]
+    assert delete_call[:2] == ["api", "repos/frankyxhl/alfred/pulls/comments/321/reactions/91"]
+    assert delete_call[delete_call.index("--method") + 1] == "DELETE"
+    post_call = runner.calls[-1]
+    assert post_call[:2] == ["api", "repos/frankyxhl/alfred/pulls/comments/321/reactions"]
+    assert post_call[post_call.index("--method") + 1] == "POST"
+
+
+def test_add_review_comment_reaction_is_idempotent_for_same_actor() -> None:
+    runner = StubRunner()
+    runner.expect(
+        ("api", "repos/frankyxhl/alfred/pulls/comments/321/reactions?per_page=100&content=%2B1"),
+        stdout=json.dumps([{"id": 92, "content": "+1", "user": {"login": "iterwheel-clearance[bot]"}}]),
+    )
+    gh = GhClient(runner=runner, actor_login="iterwheel-clearance[bot]")
+
+    out = gh.add_review_comment_reaction("frankyxhl/alfred", 321, "+1")
+
+    assert out["already_exists"] is True
+    assert len(runner.calls) == 1
 
 
 def test_command_error_raises_for_non_404_failures() -> None:
@@ -196,6 +368,32 @@ def test_auth_active_login_raises_when_unparseable() -> None:
         gh.auth_active_login()
 
 
+def test_auth_active_login_can_be_supplied_for_app_actor() -> None:
+    gh = GhClient(runner=lambda args: GhResult(1, "", "should not run"), actor_login="iterwheel-clearance[bot]")
+    assert gh.auth_active_login() == "iterwheel-clearance[bot]"
+
+
+def test_default_runner_sets_gh_token_env(monkeypatch) -> None:
+    seen = {}
+
+    class Proc:
+        returncode = 0
+        stdout = "{}"
+        stderr = ""
+
+    def fake_run(cmd, *, capture_output, text, env=None):
+        seen["cmd"] = cmd
+        seen["env"] = env
+        return Proc()
+
+    monkeypatch.setattr(gh_module.subprocess, "run", fake_run)
+    result = gh_module._default_runner(["api", "user"], token="installation-token")
+
+    assert result.returncode == 0
+    assert seen["cmd"] == ["gh", "api", "user"]
+    assert seen["env"]["GH_TOKEN"] == "installation-token"
+
+
 def test_submit_review_approve_uses_body_file_not_arg_expansion() -> None:
     """SWM-1104 fix: arbitrary maintainer text must go through --body-file (no shell expansion)."""
     runner = StubRunner()
@@ -220,6 +418,28 @@ def test_submit_review_approve_raises_on_gh_failure() -> None:
         gh.submit_review_approve("frankyxhl/trinity", 66, body="x")
 
 
+def test_submit_review_approve_with_commit_id_uses_rest_payload_file() -> None:
+    runner = StubRunner()
+    runner.expect(("api", "repos/frankyxhl/trinity/pulls/66/reviews"), stdout='{"state":"APPROVED"}')
+    gh = GhClient(runner=runner)
+
+    out = gh.submit_review_approve(
+        "frankyxhl/trinity",
+        66,
+        body="Approved by Clearance",
+        commit_id="abc123",
+    )
+
+    assert "APPROVED" in out["stdout"]
+    submitted = runner.calls[-1]
+    assert submitted[:2] == ["api", "repos/frankyxhl/trinity/pulls/66/reviews"]
+    assert "--method" in submitted
+    assert submitted[submitted.index("--method") + 1] == "POST"
+    payload_path = submitted[submitted.index("--input") + 1]
+    import os as _os
+    assert not _os.path.exists(payload_path), "payload tempfile must be cleaned up"
+
+
 def test_edit_pr_body_uses_body_file_and_cleans_up(tmp_path) -> None:
     """The temp file passed to gh pr edit must be deleted after the call."""
     runner = StubRunner()
@@ -241,3 +461,39 @@ def test_edit_pr_body_raises_on_gh_failure() -> None:
     gh = GhClient(runner=runner)
     with pytest.raises(GhCommandError, match="gh pr edit --body-file failed"):
         gh.edit_pr_body("frankyxhl/trinity", 66, body="x")
+
+
+def test_pulls_comments_flattens_paginated_slurp_output() -> None:
+    # gh api --paginate --slurp wraps multiple pages into [[page1...], [page2...]].
+    # _paginated_list must flatten to a single list; json.loads on bare concatenation fails.
+    page1 = [{"id": 1, "body": "first"}]
+    page2 = [{"id": 2, "body": "second"}, {"id": 3, "body": "third"}]
+    import json as _json
+    slurp_output = _json.dumps([page1, page2])
+
+    runner = StubRunner()
+    runner.expect(
+        ("api", "repos/owner/repo/pulls/7/comments"),
+        stdout=slurp_output,
+    )
+    gh = GhClient(runner=runner)
+    result = gh.pulls_comments("owner/repo", 7)
+
+    assert len(result) == 3
+    assert result[0]["id"] == 1
+    assert result[2]["id"] == 3
+
+
+def test_pulls_comments_handles_single_page_slurp_output() -> None:
+    # When only one page exists, --slurp still wraps it in an outer list.
+    import json as _json
+    single_page = [{"id": 10, "body": "only"}]
+    runner = StubRunner()
+    runner.expect(
+        ("api", "repos/owner/repo/pulls/8/comments"),
+        stdout=_json.dumps([single_page]),
+    )
+    gh = GhClient(runner=runner)
+    result = gh.pulls_comments("owner/repo", 8)
+    assert len(result) == 1
+    assert result[0]["id"] == 10

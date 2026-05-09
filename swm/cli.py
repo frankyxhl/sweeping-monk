@@ -19,11 +19,22 @@ from rich.text import Text
 from rich.table import Table
 
 from . import dashboard, guarded
+from .close_reason import (
+    build_thread_conclusion_comment,
+    existing_conclusion_markers,
+    has_flash_close_reason,
+)
 from .gh import GhClient, GhCommandError
-from .poll import poll as run_poll
+from .github_app import InstallationTokenProvider
+from .investigator import build_investigator_from_env
+from .models import GitHubThreadState, Stage15Action, Thread, ThreadSnapshot, Verdict
+from .poll import poll as run_poll, poll_pr
 from .state import StateStore, default_store, now_utc
+from .webhook import load_config, serve as serve_webhook
 
 app = typer.Typer(help="Sweeping-Monk PR watchdog CLI", no_args_is_help=True)
+webhook_app = typer.Typer(help="GitHub webhook receiver commands", no_args_is_help=True)
+app.add_typer(webhook_app, name="webhook")
 console = Console()
 
 
@@ -50,6 +61,20 @@ def _validate_repo(value: str | None) -> str | None:
 
 def _store(state_dir: Optional[str]) -> StateStore:
     return StateStore(Path(state_dir)) if state_dir else default_store()
+
+
+def _gh_client(actor_name: str | None = None, *, config_path: str = "~/.config/swm/watchd.toml") -> GhClient:
+    if not actor_name:
+        return GhClient()
+    config = load_config(config_path)
+    actor = config.actor(actor_name)
+    token = InstallationTokenProvider().token_for(
+        app_id=actor.app_id,
+        installation_id=actor.installation_id,
+        private_key_path=actor.private_key_path,
+        api_url=actor.api_url,
+    )
+    return GhClient(token=token, actor_login=actor.bot_login)
 
 
 @app.command("dashboard")
@@ -132,6 +157,331 @@ def poll_cmd(
     if any(o.sync_actions for o in outcomes):
         synced = sum(len(o.sync_actions) for o in outcomes)
         console.print(f"[green]Stage 1.5 sync: resolved {synced} thread(s) on GitHub[/green]")
+
+
+def _closable_threads(record_threads: list[Thread], snapshots: list[ThreadSnapshot]) -> list[Thread]:
+    by_id = {snapshot.thread_id: snapshot for snapshot in snapshots}
+    closable: list[Thread] = []
+    for thread in record_threads:
+        snapshot = by_id.get(thread.id)
+        if not snapshot or not snapshot.github_state:
+            continue
+        if thread.verdict is Verdict.RESOLVED and not snapshot.github_state.isResolved:
+            closable.append(thread)
+    return closable
+
+
+def _open_review_threads(record_threads: list[Thread], snapshots: list[ThreadSnapshot]) -> list[Thread]:
+    by_id = {snapshot.thread_id: snapshot for snapshot in snapshots}
+    review_threads: list[Thread] = []
+    for thread in record_threads:
+        snapshot = by_id.get(thread.id)
+        if not snapshot or not snapshot.github_state:
+            continue
+        if not snapshot.github_state.isResolved:
+            review_threads.append(thread)
+    return review_threads
+
+
+def _conclusion_reply_exists(
+    comments: list[dict],
+    thread: Thread,
+    *,
+    head_sha: str,
+    actor_login: str | None,
+) -> bool:
+    markers = existing_conclusion_markers(thread, head_sha=head_sha)
+    for comment in comments:
+        body = str(comment.get("body") or "")
+        if not any(marker in body for marker in markers):
+            continue
+        if not actor_login:
+            return True
+        user = comment.get("user") or comment.get("author") or {}
+        if user.get("login") == actor_login:
+            return True
+    return False
+
+
+def _thread_reaction_content(thread: Thread) -> str:
+    return "+1" if thread.verdict is Verdict.RESOLVED else "-1"
+
+
+def _clip_line(value: str | None, limit: int = 220) -> str:
+    value = " ".join((value or "").split())
+    if len(value) <= limit:
+        return value
+    return value[: limit - 3].rstrip() + "..."
+
+
+def _build_close_items_run_comment(
+    record,
+    *,
+    sync_count: int,
+    actor: str | None,
+    error: str | None = None,
+) -> str:
+    lines = [
+        "<!-- swm:close-items-run -->",
+        "Clearance run conclusion",
+        "",
+        f"- Status: `{record.status.value}`",
+        f"- PR: `{record.repo}#{record.pr}`",
+        f"- Head: `{record.head_sha[:12]}`",
+        f"- Actor: `{actor or 'gh active account'}`",
+        f"- Findings: `{record.codex_resolved}/{len(record.threads)}` resolved",
+        f"- Closed this run: `{sync_count}`",
+        f"- CI: `{', '.join(f'{name}={value.value}' for name, value in sorted(record.ci.items())) or 'none'}`",
+        f"- Merge state: `{record.merge_state or 'unknown'}`",
+    ]
+    if error:
+        lines.append(f"- Writeback error: `{_clip_line(error, 500)}`")
+    if record.threads:
+        lines.extend(["", "Review findings:"])
+        for index, thread in enumerate(record.threads, start=1):
+            location = f"{thread.path}:{thread.line}" if thread.line else thread.path
+            lines.append(
+                f"- #{index} `{thread.verdict.value}` {location} - "
+                f"{_clip_line(thread.llm_reason or thread.verdict_reason)}"
+            )
+    else:
+        lines.extend(["", "Review findings: none"])
+    return "\n".join(lines)
+
+
+@app.command("close-items")
+def close_items_cmd(
+    repo: str = typer.Argument(..., help="owner/repo, e.g. frankyxhl/alfred", callback=_validate_repo),
+    pr: int = typer.Argument(..., help="PR number"),
+    base: str = typer.Option("main", "--base", help="Base branch to filter PRs by"),
+    actor: Optional[str] = typer.Option(None, "--actor", help="GitHub App actor from watchd config, e.g. clearance"),
+    config: str = typer.Option("~/.config/swm/watchd.toml", "--config", help="watchd TOML config for --actor"),
+    require_flash: bool = typer.Option(False, "--require-flash", help="Refuse to close any item without a Flash investigator reason"),
+    yes: bool = typer.Option(False, "--yes", "-y", help="Skip the [y/N] confirmation prompt"),
+    state_dir: Optional[str] = typer.Option(None, "--state-dir"),
+) -> None:
+    """Close GitHub review threads that SWM currently judges RESOLVED.
+
+    This is a targeted Stage 1.5 writeback for one PR. It does not approve,
+    comment, tick checkboxes, or merge.
+    """
+    store = _store(state_dir)
+    gh_client = _gh_client(actor, config_path=config)
+
+    try:
+        open_prs = gh_client.list_open_prs(repo, base=base)
+        pr_summary = next(
+            (
+                item for item in open_prs
+                if item.get("number") == pr
+                and not item.get("isDraft")
+                and item.get("baseRefName") == base
+            ),
+            None,
+        )
+        if pr_summary is None:
+            _abort(f"no open non-draft PR #{pr} in {repo} (base={base})")
+
+        branch_protection = gh_client.branch_protection(repo, base)
+        record, snapshots = poll_pr(
+            pr_summary,
+            repo=repo,
+            gh_client=gh_client,
+            branch_protected=branch_protection is not None,
+            investigator=build_investigator_from_env(),
+            now=now_utc(),
+        )
+    except GhCommandError as exc:
+        _abort(str(exc))
+
+    open_threads = _open_review_threads(record.threads, snapshots)
+    closable = _closable_threads(record.threads, snapshots)
+    snapshots_by_id = {snapshot.thread_id: snapshot for snapshot in snapshots}
+    if not open_threads:
+        record = record.model_copy(update={"trigger": "manual-close-items"})
+        store.append_poll(record)
+        for snapshot in snapshots:
+            store.write_thread(snapshot)
+        gh_client.create_issue_comment(
+            repo,
+            pr,
+            _build_close_items_run_comment(record, sync_count=0, actor=actor),
+        )
+        console.print(f"[yellow]no open review items for {repo}#{pr}[/yellow]")
+        console.print(dashboard.pr_card(record, snapshots[0] if snapshots else None))
+        return
+
+    table = Table(title=f"Open review items — {repo}#{pr}", show_header=True, header_style="bold")
+    table.add_column("#", justify="right")
+    table.add_column("Thread")
+    table.add_column("Location")
+    table.add_column("Verdict")
+    table.add_column("Verifier")
+    table.add_column("Reason", style="dim")
+    for index, thread in enumerate(open_threads, start=1):
+        snapshot = snapshots_by_id.get(thread.id)
+        line = f":{thread.line}" if thread.line else ""
+        table.add_row(
+            str(index),
+            thread.id,
+            f"{thread.path}{line}",
+            thread.verdict.value,
+            "Flash" if has_flash_close_reason(thread, snapshot) else "SWM",
+            thread.verdict_reason,
+        )
+    console.print(table)
+    console.print(
+        f"[bold]Plan:[/bold] mark {len(open_threads)} review item(s), "
+        f"close {len(closable)} resolved item(s), on "
+        f"{repo}#{pr} @ {record.head_sha[:8]}"
+    )
+    # Snapshot the confirmed plan (id + verdict for every displayed thread) before
+    # waiting for user input. Tracks both set membership and verdict changes.
+    confirmed_open = {(t.id, t.verdict) for t in open_threads}
+
+    if not _confirm("Apply?", yes=yes):
+        console.print("[yellow]aborted[/yellow]")
+        raise typer.Exit(code=1)
+
+    current_pr = gh_client.view_pr(repo, pr, ["headRefOid"])
+    current_head = current_pr.get("headRefOid", "")
+    if current_head != record.head_sha:
+        _abort(
+            f"PR head changed since poll ({record.head_sha[:8]} → {current_head[:8]}); "
+            "re-run close-items to poll the new head"
+        )
+
+    try:
+        record, snapshots = poll_pr(
+            pr_summary,
+            repo=repo,
+            gh_client=gh_client,
+            branch_protected=branch_protection is not None,
+            investigator=build_investigator_from_env(),
+            now=now_utc(),
+        )
+    except GhCommandError as exc:
+        _abort(str(exc))
+
+    # Re-read head after re-poll: pr_summary was fetched before confirmation
+    # and carries a possibly-stale headRefOid that poll_pr() uses for
+    # record.head_sha. A push landing during poll_pr() would go undetected
+    # without this second check.
+    post_poll_view = gh_client.view_pr(repo, pr, ["headRefOid"])
+    post_poll_head = post_poll_view.get("headRefOid", "")
+    if post_poll_head != record.head_sha:
+        _abort(
+            f"PR head changed during re-poll ({record.head_sha[:8]} → {post_poll_head[:8]}); "
+            "re-run close-items"
+        )
+
+    snapshots_by_id = {s.thread_id: s for s in snapshots}
+    open_threads = _open_review_threads(record.threads, snapshots)
+    closable = _closable_threads(record.threads, snapshots)
+
+    if {(t.id, t.verdict) for t in open_threads} != confirmed_open:
+        _abort(
+            "Thread state changed while waiting for confirmation — "
+            "re-run close-items to see the updated plan"
+        )
+
+    for thread in open_threads:
+        snapshot = snapshots_by_id.get(thread.id)
+        if require_flash and thread.verdict is Verdict.RESOLVED and not has_flash_close_reason(thread, snapshot):
+            _abort(f"{thread.id} has no Flash investigator reason; refusing to close")
+        if thread.comment_id <= 0:
+            _abort(f"{thread.id} has no GitHub review comment id; refusing to write a conclusion")
+
+    reply_results: dict[str, dict] = {}
+    reaction_results: dict[str, dict] = {}
+    actions = []
+    try:
+        existing_comments = gh_client.pulls_comments(repo, pr)
+        actor_login = gh_client.actor_login
+        for thread in open_threads:
+            snapshot = snapshots_by_id.get(thread.id)
+            reaction_results[thread.id] = gh_client.set_review_comment_reaction(
+                repo,
+                thread.comment_id,
+                _thread_reaction_content(thread),
+            )
+            if _conclusion_reply_exists(
+                existing_comments,
+                thread,
+                head_sha=record.head_sha,
+                actor_login=actor_login,
+            ):
+                reply_results[thread.id] = {"skipped": True, "reason": "existing Clearance conclusion for this head"}
+            else:
+                body = build_thread_conclusion_comment(thread, snapshot, head_sha=record.head_sha)
+                reply_results[thread.id] = gh_client.reply_to_review_comment(
+                    repo, pr, thread.comment_id, body,
+                )
+            if (snapshot and snapshot.github_state
+                    and thread.verdict is Verdict.RESOLVED
+                    and not snapshot.github_state.isResolved):
+                resolve_result = gh_client.resolve_thread(thread.id)
+                actions.append(Stage15Action(
+                    mutation="resolveReviewThread",
+                    threadId=thread.id,
+                    result=resolve_result or {},
+                ))
+                snapshot.github_state = GitHubThreadState(
+                    isResolved=True,
+                    isOutdated=snapshot.github_state.isOutdated,
+                    synced_via="Stage 1.5 resolveReviewThread",
+                    synced_at=record.ts,
+                )
+                thread.github_isResolved = True
+    except GhCommandError as exc:
+        record = record.model_copy(update={
+            "stage15_actions": actions,
+            "trigger": "manual-close-items+writeback-error",
+        })
+        store.append_poll(record)
+        for snapshot in snapshots:
+            store.write_thread(snapshot)
+        try:
+            gh_client.create_issue_comment(
+                repo,
+                pr,
+                _build_close_items_run_comment(
+                    record,
+                    sync_count=len(actions),
+                    actor=actor,
+                    error=str(exc),
+                ),
+            )
+        except GhCommandError as comment_exc:
+            console.print(f"[red]✗ failed to append run conclusion: {comment_exc}[/red]")
+        _abort(str(exc))
+
+    if reply_results:
+        actions = [
+            action.model_copy(update={
+                "result": {
+                    **action.result,
+                    "close_reason_comment": reply_results.get(action.threadId, {}),
+                    "reaction": reaction_results.get(action.threadId, {}),
+                },
+            })
+            for action in actions
+        ]
+    record = record.model_copy(update={
+        "stage15_actions": actions,
+        "trigger": "manual-close-items+stage1.5-sync" if actions else "manual-close-items",
+    })
+    store.append_poll(record)
+    for snapshot in snapshots:
+        store.write_thread(snapshot)
+    gh_client.create_issue_comment(
+        repo,
+        pr,
+        _build_close_items_run_comment(record, sync_count=len(actions), actor=actor),
+    )
+
+    console.print(f"[green]✓[/green] closed {len(actions)} review item(s) on GitHub")
+    console.print(dashboard.pr_card(record, snapshots[0] if snapshots else None))
 
 
 def _confirm(prompt: str, *, yes: bool) -> bool:
@@ -433,6 +783,23 @@ def rule_coverage_cmd(
         rule = latest.rule_id or "—"
         table.add_row(str(len(ms)), canon[:80], rule, latest.ts.strftime("%Y-%m-%d %H:%M"))
     console.print(table)
+
+
+@webhook_app.command("serve")
+def webhook_serve_cmd(
+    config: str = typer.Option(
+        "~/.config/swm/watchd.toml",
+        "--config",
+        help="watchd TOML config with server, actors, and watched repos",
+    ),
+) -> None:
+    """Serve GitHub App webhook events for Clearance-style automation."""
+    cfg = load_config(config)
+    console.print(
+        f"[green]serving[/green] {cfg.server.path} on "
+        f"{cfg.server.host}:{cfg.server.port}"
+    )
+    serve_webhook(cfg)
 
 
 if __name__ == "__main__":

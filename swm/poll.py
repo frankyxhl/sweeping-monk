@@ -16,13 +16,21 @@ orchestrator.
 """
 from __future__ import annotations
 
+import subprocess
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 
 import typer
 
 from . import classify, judge, severity
-from .gh import GhClient
+from .gh import GhClient, GhCommandError
+from .investigator import (
+    InvestigationDecision,
+    InvestigationError,
+    ThreadInvestigationInput,
+    ThreadInvestigator,
+    build_investigator_from_env,
+)
 from .models import (
     CIConclusion,
     Evidence,
@@ -132,12 +140,94 @@ def _codex_severity_from_body(thread: dict) -> str:
     return "P3"
 
 
+def _thread_initial_body(thread: dict) -> str:
+    comments = (thread.get("comments") or {}).get("nodes") or []
+    if not comments:
+        return ""
+    return comments[0].get("body") or ""
+
+
+def _decision_to_verdict(decision: InvestigationDecision) -> Verdict:
+    if decision.verdict == "RESOLVED":
+        return Verdict.RESOLVED
+    if decision.verdict == "OPEN":
+        return Verdict.OPEN
+    return Verdict.NEEDS_HUMAN_JUDGMENT
+
+
+def _maybe_investigate_thread(
+    *,
+    investigator: ThreadInvestigator | None,
+    repo: str,
+    pr: int,
+    pr_title: str | None,
+    head_sha: str,
+    path: str,
+    line: int | None,
+    classification: str,
+    thread: dict,
+    author_reply_body: str | None,
+    codex_followup_body: str | None,
+    heuristic: judge.VerdictDecision,
+    diff_excerpt: str,
+) -> tuple[judge.VerdictDecision, InvestigationDecision | None, str | None]:
+    """Let the optional LLM investigator override heuristic B/C verdicts.
+
+    GitHub-resolved threads and explicit Codex follow-ups are handled in
+    judge.judge() and are intentionally not second-guessed here.
+    """
+    if investigator is None:
+        return heuristic, None, None
+    if classification not in {"B", "C"}:
+        return heuristic, None, None
+    if thread.get("isResolved"):
+        return heuristic, None, None
+    if judge.codex_followup_reaction(codex_followup_body):
+        return heuristic, None, None
+
+    try:
+        decision = investigator.investigate(
+            ThreadInvestigationInput(
+                repo=repo,
+                pr=pr,
+                pr_title=pr_title,
+                head_sha=head_sha,
+                path=path,
+                line=line,
+                classification=classification,  # type: ignore[arg-type]
+                codex_comment_body=_thread_initial_body(thread),
+                author_reply_body=author_reply_body,
+                diff_excerpt=diff_excerpt,
+                heuristic_verdict=heuristic.verdict.value,
+                heuristic_reason=heuristic.reason,
+            )
+        )
+    except (InvestigationError, TimeoutError, subprocess.TimeoutExpired, OSError) as exc:
+        return heuristic, None, f"{type(exc).__name__}: {exc}"
+
+    verdict = _decision_to_verdict(decision)
+    return (
+        judge.VerdictDecision(
+            verdict,
+            f"LLM investigator: {decision.reason}",
+            substantive=heuristic.substantive,
+        ),
+        decision,
+        None,
+    )
+
+
 def _process_thread(
     thread: dict,
     *,
     repo: str,
     pr: int,
+    pr_title: str | None,
+    head_sha: str,
     branch_protected: bool,
+    diff_excerpt: str,
+    diff_error: str | None = None,
+    investigator: ThreadInvestigator | None,
     now,
 ) -> tuple[Thread, ThreadSnapshot]:
     state = classify.classify_thread(thread)
@@ -155,12 +245,27 @@ def _process_thread(
     reply = classify.latest_author_reply(thread)
     followup = classify.latest_codex_followup(thread)
 
-    verdict_decision = judge.judge(
+    heuristic_decision = judge.judge(
         classification=state,
         author_reply_body=(reply or {}).get("body"),
         code_changed=(state == "B"),
         codex_followup_body=(followup or {}).get("body"),
         github_isResolved=bool(thread.get("isResolved")),
+    )
+    verdict_decision, llm_decision, llm_error = _maybe_investigate_thread(
+        investigator=investigator,
+        repo=repo,
+        pr=pr,
+        pr_title=pr_title,
+        head_sha=head_sha,
+        path=thread.get("path") or "unknown",
+        line=thread.get("line"),
+        classification=state,
+        thread=thread,
+        author_reply_body=(reply or {}).get("body"),
+        codex_followup_body=(followup or {}).get("body"),
+        heuristic=heuristic_decision,
+        diff_excerpt=diff_excerpt,
     )
 
     comment_id = classify.codex_comment_id(thread) or 0
@@ -181,6 +286,9 @@ def _process_thread(
         author_reply_substantive=verdict_decision.substantive,
         code_changed=(state == "B"),
         demotion_reason=sev_decision.reason,
+        llm_verdict=llm_decision.verdict if llm_decision else None,
+        llm_confidence=llm_decision.confidence if llm_decision else None,
+        llm_reason=llm_decision.reason if llm_decision else None,
     )
 
     snapshot = ThreadSnapshot(
@@ -205,6 +313,11 @@ def _process_thread(
             author_reply_substantive=verdict_decision.substantive,
             code_changed=(state == "B"),
             codex_followed_up=bool(followup),
+            llm_verdict=llm_decision.verdict if llm_decision else None,
+            llm_confidence=llm_decision.confidence if llm_decision else None,
+            llm_reason=llm_decision.reason if llm_decision else None,
+            llm_evidence=llm_decision.evidence if llm_decision else None,
+            llm_error=llm_error or diff_error,
             demotion_reason=sev_decision.reason,
         ),
         github_state=GitHubThreadState(
@@ -263,16 +376,38 @@ def poll_pr(
     gh_client: GhClient,
     branch_protected: bool,
     now,
+    investigator: ThreadInvestigator | None = None,
 ) -> tuple[PollRecord, list[ThreadSnapshot]]:
     """Build a PollRecord + ThreadSnapshots for a single open PR."""
     pr = pr_summary["number"]
     head_sha = pr_summary["headRefOid"]
     raw_threads = gh_client.review_threads(repo, pr)
     codex_threads = [t for t in raw_threads if classify.is_codex_thread(t)]
+    diff_excerpt = ""
+    diff_error: str | None = None
+    if investigator and codex_threads:
+        try:
+            diff_excerpt = gh_client.pr_diff(repo, pr)
+        except GhCommandError as exc:
+            diff_error = f"diff fetch failed: {exc}"
     thread_models: list[Thread] = []
     snapshots: list[ThreadSnapshot] = []
+    # Disable LLM investigation when diff fetch failed — the model would receive
+    # an empty diff and could return RESOLVED on incomplete evidence.
+    active_investigator = None if diff_error else investigator
     for t in codex_threads:
-        m, snap = _process_thread(t, repo=repo, pr=pr, branch_protected=branch_protected, now=now)
+        m, snap = _process_thread(
+            t,
+            repo=repo,
+            pr=pr,
+            pr_title=pr_summary.get("title"),
+            head_sha=head_sha,
+            branch_protected=branch_protected,
+            diff_excerpt=diff_excerpt,
+            diff_error=diff_error,
+            investigator=active_investigator,
+            now=now,
+        )
         thread_models.append(m)
         snapshots.append(snap)
 
@@ -346,9 +481,11 @@ def poll(
     gh_client: GhClient,
     sync: bool = False,
     base: str = "main",
+    investigator: ThreadInvestigator | None = None,
 ) -> list[PollOutcome]:
     """Run one full poll cycle for `repo` and persist results to `store`."""
     now = now_utc()
+    investigator = investigator or build_investigator_from_env()
     open_prs = gh_client.list_open_prs(repo)
     open_prs = [pr for pr in open_prs if pr.get("baseRefName") == base and not pr.get("isDraft")]
     branch_protection = gh_client.branch_protection(repo, base)
@@ -361,6 +498,7 @@ def poll(
             repo=repo,
             gh_client=gh_client,
             branch_protected=branch_protected,
+            investigator=investigator,
             now=now,
         )
         actions: list[Stage15Action] = []
