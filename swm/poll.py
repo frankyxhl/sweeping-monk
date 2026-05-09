@@ -16,6 +16,7 @@ orchestrator.
 """
 from __future__ import annotations
 
+import subprocess
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 
@@ -201,7 +202,7 @@ def _maybe_investigate_thread(
                 heuristic_reason=heuristic.reason,
             )
         )
-    except (InvestigationError, TimeoutError, OSError) as exc:
+    except (InvestigationError, TimeoutError, subprocess.TimeoutExpired, OSError) as exc:
         return heuristic, None, f"{type(exc).__name__}: {exc}"
 
     verdict = _decision_to_verdict(decision)

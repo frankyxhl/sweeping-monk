@@ -347,6 +347,13 @@ def close_items_cmd(
             "re-run close-items to poll the new head"
         )
 
+    for thread in open_threads:
+        snapshot = snapshots_by_id.get(thread.id)
+        if require_flash and thread.verdict is Verdict.RESOLVED and not has_flash_close_reason(thread, snapshot):
+            _abort(f"{thread.id} has no Flash investigator reason; refusing to close")
+        if thread.comment_id <= 0:
+            _abort(f"{thread.id} has no GitHub review comment id; refusing to write a conclusion")
+
     reply_results: dict[str, dict] = {}
     reaction_results: dict[str, dict] = {}
     actions = []
@@ -355,10 +362,6 @@ def close_items_cmd(
         actor_login = gh_client.actor_login
         for thread in open_threads:
             snapshot = snapshots_by_id.get(thread.id)
-            if require_flash and thread.verdict is Verdict.RESOLVED and not has_flash_close_reason(thread, snapshot):
-                _abort(f"{thread.id} has no Flash investigator reason; refusing to close")
-            if thread.comment_id <= 0:
-                _abort(f"{thread.id} has no GitHub review comment id; refusing to write a conclusion")
             reaction_results[thread.id] = gh_client.set_review_comment_reaction(
                 repo,
                 thread.comment_id,

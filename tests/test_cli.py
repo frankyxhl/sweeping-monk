@@ -412,6 +412,30 @@ def test_close_items_aborts_when_head_drifts_after_confirmation(store: StateStor
     assert write_calls == [], "no writebacks should occur when head drifts"
 
 
+def test_close_items_require_flash_preflights_all_threads_before_any_mutation(store: StateStore, monkeypatch) -> None:
+    """--require-flash must validate ALL threads before any write; no partial mutation."""
+    from tests.conftest import FakeGhClient
+
+    threads = [
+        _codex_review_thread("PRRT_A"),
+        _codex_review_thread("PRRT_B"),
+    ]
+    fake = FakeGhClient(prs=[_open_pr(49)], review_threads={49: threads})
+    monkeypatch.setattr("swm.cli.GhClient", lambda: fake)
+    monkeypatch.setattr("swm.cli.build_investigator_from_env", lambda: None)
+
+    result = runner.invoke(app, [
+        "close-items", "owner/repo", "49",
+        "--require-flash", "--yes",
+        "--state-dir", str(store.directory),
+    ])
+
+    assert result.exit_code == 1
+    assert "no Flash investigator reason" in result.stdout or "refusing to close" in result.stdout
+    write_calls = [c for c in fake.calls if c[0] in {"set_review_comment_reaction", "reply_to_review_comment", "resolve_thread"}]
+    assert write_calls == [], "no mutations must fire before preflight completes"
+
+
 # --- SWM-1104 guarded subcommand tests --------------------------------------
 
 

@@ -608,3 +608,28 @@ def test_swm_poll_emits_at_most_one_notify_line_per_invocation(
         f"{result_no_change.stdout}"
     )
     assert "no change:" in result_no_change.stdout
+
+
+def test_poll_investigator_falls_back_on_subprocess_timeout(store: StateStore) -> None:
+    """subprocess.TimeoutExpired must be caught and treated as an investigation error,
+    not propagate and abort the poll."""
+    import subprocess as _subprocess
+    from swm.investigator import InvestigationError
+
+    class TimeoutInvestigator:
+        def investigate(self, item):
+            raise _subprocess.TimeoutExpired(cmd="openclawcli", timeout=30)
+
+    gh = FakeGhClient(
+        prs=[_pr_summary()],
+        review_threads={49: [_codex_thread(thread_id="PRRT_timeout")]},
+    )
+
+    outcomes = poll("owner/repo", store=store, gh_client=gh, investigator=TimeoutInvestigator())
+
+    record = outcomes[0].record
+    # Poll must complete (not raise); deterministic heuristic takes over.
+    assert record is not None
+    thread = record.threads[0]
+    assert thread.llm_verdict is None
+    assert thread.llm_reason is None
