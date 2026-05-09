@@ -553,6 +553,50 @@ def test_close_items_aborts_when_thread_state_drifts_after_confirmation(store: S
     assert write_calls == [], f"no writebacks expected after drift abort, got: {write_calls}"
 
 
+def test_close_items_aborts_when_head_drifts_during_repoll(store: StateStore, monkeypatch) -> None:
+    """Head drift that occurs DURING the post-confirmation re-poll (after the
+    TOCTOU check passes but while poll_pr() is running with a stale pr_summary)
+    must be caught by the second view_pr call and abort without any writes."""
+    from tests.conftest import FakeGhClient
+    from swm.investigator import InvestigationDecision
+
+    class FakeInvestigator:
+        def investigate(self, item):
+            return InvestigationDecision(verdict="RESOLVED", confidence=0.9, reason="ok", evidence=[])
+
+    class LateRepollDriftGh(FakeGhClient):
+        def view_pr(self, repo, pr, fields):
+            self._record("view_pr", repo, pr, fields=fields)
+            # Count only view_pr calls that include headRefOid (including this one,
+            # since _record was already called above).
+            headref_calls = sum(
+                1 for c in self.calls
+                if c[0] == "view_pr" and "headRefOid" in c[2].get("fields", [])
+            )
+            if headref_calls >= 2 and "headRefOid" in fields:
+                # Post-repoll check: return a drifted head.
+                pr_data = next(p for p in self._prs if p["number"] == pr)
+                return {**pr_data, "headRefOid": "latdrift0" + "0" * 31}
+            return next(p for p in self._prs if p["number"] == pr)
+
+    fake = LateRepollDriftGh(
+        prs=[_open_pr(49)],
+        review_threads={49: [_codex_review_thread("PRRT_49")]},
+    )
+    monkeypatch.setattr("swm.cli.GhClient", lambda: fake)
+    monkeypatch.setattr("swm.cli.build_investigator_from_env", lambda: FakeInvestigator())
+
+    result = runner.invoke(app, [
+        "close-items", "owner/repo", "49", "--yes",
+        "--state-dir", str(store.directory),
+    ])
+
+    assert result.exit_code == 1
+    assert "head changed during re-poll" in result.stdout or "re-run close-items" in result.stdout
+    write_calls = [c for c in fake.calls if c[0] in {"set_review_comment_reaction", "resolve_thread", "reply_to_review_comment"}]
+    assert write_calls == [], f"no writes expected when head drifts during re-poll, got: {write_calls}"
+
+
 def test_close_items_aborts_on_verdict_change_without_id_change(store: StateStore, monkeypatch) -> None:
     """Drift detection must fire when a thread's verdict changes (e.g. OPEN →
     NEEDS_HUMAN_JUDGMENT) even when the thread IDs are unchanged — catches the

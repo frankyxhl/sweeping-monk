@@ -362,6 +362,19 @@ def close_items_cmd(
         )
     except GhCommandError as exc:
         _abort(str(exc))
+
+    # Re-read head after re-poll: pr_summary was fetched before confirmation
+    # and carries a possibly-stale headRefOid that poll_pr() uses for
+    # record.head_sha. A push landing during poll_pr() would go undetected
+    # without this second check.
+    post_poll_view = gh_client.view_pr(repo, pr, ["headRefOid"])
+    post_poll_head = post_poll_view.get("headRefOid", "")
+    if post_poll_head != record.head_sha:
+        _abort(
+            f"PR head changed during re-poll ({record.head_sha[:8]} → {post_poll_head[:8]}); "
+            "re-run close-items"
+        )
+
     snapshots_by_id = {s.thread_id: s for s in snapshots}
     open_threads = _open_review_threads(record.threads, snapshots)
     closable = _closable_threads(record.threads, snapshots)
