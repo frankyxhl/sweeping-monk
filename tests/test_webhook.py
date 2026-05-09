@@ -199,3 +199,70 @@ def test_process_webhook_dedupes_delivery_id(tmp_path: Path, monkeypatch) -> Non
 
     assert first.status == "ignored-repo"
     assert second.status == "duplicate"
+
+
+def test_auto_approve_ledgers_even_when_verify_view_pr_fails(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """Ledger entry must be written immediately after submit_review_approve succeeds,
+    not after the nonessential verification view_pr — so a transient verify error
+    cannot leave an unaudited approval."""
+    import datetime as _dt
+    from swm.gh import GhCommandError
+    from swm.models import CIConclusion, PollRecord, Status
+    from swm.poll import PollOutcome
+    from swm.state import StateStore
+    from tests.conftest import FakeGhClient
+
+    store = StateStore(tmp_path / "state")
+    cfg = _config(tmp_path)
+    monkeypatch.setenv("SWM_TEST_WEBHOOK_SECRET", "secret")
+
+    head = "verify00" + "0" * 32
+    record = PollRecord(
+        ts=_dt.datetime(2026, 5, 9, 10, 0, tzinfo=_dt.timezone.utc),
+        repo="owner/repo", pr=66, title="verify-fail PR",
+        head_sha=head, status=Status.READY,
+        ci={"test": CIConclusion.SUCCESS}, merge_state="CLEAN",
+        codex_open=0, codex_resolved=0, threads=[], trigger="test",
+    )
+
+    class VerifyFailGh(FakeGhClient):
+        def __init__(self, *, token=None, actor_login=None):
+            super().__init__(
+                prs=[{"number": 66, "headRefOid": head, "author": {"login": "someone"}}],
+                active_login=actor_login or "iterwheel-clearance[bot]",
+            )
+            self.token = token
+
+        def view_pr(self, repo, pr, fields):
+            self._record("view_pr", repo, pr, fields=fields)
+            # Pre-approve reads succeed; the post-approve verify raises.
+            if "reviewDecision" in fields:
+                raise GhCommandError("transient verify failure")
+            return next(p for p in self._prs if p["number"] == pr)
+
+    def fake_run_poll(repo, *, store, gh_client, sync, base):
+        store.append_poll(record)
+        return [PollOutcome(record=record, snapshots=[], sync_actions=[], is_no_change=False)]
+
+    class FakeTokenProvider:
+        def token_for(self, **kwargs):
+            return "installation-token"
+
+    monkeypatch.setattr("swm.webhook.run_poll", fake_run_poll)
+    monkeypatch.setattr("swm.webhook.GhClient", VerifyFailGh)
+
+    body = json.dumps({"repository": {"full_name": "owner/repo"}}).encode()
+    result = process_webhook(
+        headers=_headers(body), body=body, config=cfg,
+        token_provider=FakeTokenProvider(), store=store,
+    )
+
+    # Approval must still be recorded as "approved" (not "approve-error").
+    assert any(a.action == "approved" for a in result.actions), \
+        f"expected approved action, got: {[a.action for a in result.actions]}"
+    # Ledger must exist despite verify failure.
+    ledger = store.read_ledger("owner/repo", 66)
+    assert len(ledger) == 1, "ledger entry must survive a verify view_pr failure"
+    assert ledger[0].actor == "iterwheel-clearance[bot]"

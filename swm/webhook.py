@@ -239,18 +239,24 @@ def _auto_approve_ready_pr(
         review_result = gh_client.submit_review_approve(
             record.repo, record.pr, body, commit_id=current_head,
         )
-        verify = gh_client.view_pr(record.repo, record.pr, ["reviewDecision", "mergeStateStatus"])
     except GhCommandError as exc:
         return WebhookAction(record.repo, record.pr, "approve-error", str(exc))
 
+    # Ledger immediately after the write succeeds — before nonessential verification,
+    # so a transient verify failure cannot leave an unaudited approval.
     entry = guarded.build_approve_ledger_entry(
         poll=record,
         actor=identity.active_login,
         reason=reason,
         authorized_by="standing authorization (webhook auto_approve=true)",
-        review_result={"stdout": review_result.get("stdout", ""), **verify},
+        review_result={"stdout": review_result.get("stdout", "")},
     )
     store.append_ledger(entry)
+
+    try:
+        verify = gh_client.view_pr(record.repo, record.pr, ["reviewDecision", "mergeStateStatus"])
+    except GhCommandError:
+        verify = {}
     return WebhookAction(
         record.repo,
         record.pr,
