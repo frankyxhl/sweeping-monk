@@ -135,15 +135,20 @@ def test_review_threads_handles_missing_pr_key() -> None:
     assert client.review_threads("owner/repo", 99) == []
 
 
+def _no_overflow_comments(nodes: list[dict]) -> dict:
+    """Helper: comments connection with no further pages."""
+    return {"pageInfo": {"hasNextPage": False, "endCursor": None}, "nodes": nodes}
+
+
 def test_review_threads_paginates_when_has_next_page() -> None:
     # Arrange — page 1 signals hasNextPage; page 2 has endCursor=null/no-next
     page1 = {"data": {"repository": {"pullRequest": {"reviewThreads": {
         "pageInfo": {"hasNextPage": True, "endCursor": "cursor-abc"},
-        "nodes": [{"id": "T1", "isResolved": False, "isOutdated": False, "comments": {"nodes": []}}],
+        "nodes": [{"id": "T1", "isResolved": False, "isOutdated": False, "comments": _no_overflow_comments([])}],
     }}}}}
     page2 = {"data": {"repository": {"pullRequest": {"reviewThreads": {
         "pageInfo": {"hasNextPage": False, "endCursor": None},
-        "nodes": [{"id": "T2", "isResolved": True,  "isOutdated": False, "comments": {"nodes": []}}],
+        "nodes": [{"id": "T2", "isResolved": True,  "isOutdated": False, "comments": _no_overflow_comments([])}],
     }}}}}
     responses: list[dict] = [page1, page2]
     calls: list[list[str]] = []
@@ -157,11 +162,50 @@ def test_review_threads_paginates_when_has_next_page() -> None:
     # Act
     threads = client.review_threads("owner/repo", 7)
 
-    # Assert — both pages collected
+    # Assert — both pages collected, no comment overflow queries
     assert [t["id"] for t in threads] == ["T1", "T2"]
     assert len(calls) == 2
-    # second call must carry the cursor
     assert any("cursor=cursor-abc" in a for a in calls[1])
+
+
+def test_review_threads_paginates_nested_comments_when_thread_overflows() -> None:
+    # Arrange — single thread with comments.hasNextPage=true; one overflow page
+    c1 = {"databaseId": 1, "author": {"login": "codex"}, "body": "P2 issue", "createdAt": "2026-05-09T00:00:00Z", "replyTo": None}
+    c2 = {"databaseId": 2, "author": {"login": "human"}, "body": "fixed", "createdAt": "2026-05-09T01:00:00Z", "replyTo": {"databaseId": 1}}
+    overflow_comment = {"databaseId": 3, "author": {"login": "human"}, "body": "actually reverting", "createdAt": "2026-05-09T02:00:00Z", "replyTo": {"databaseId": 1}}
+
+    threads_response = {"data": {"repository": {"pullRequest": {"reviewThreads": {
+        "pageInfo": {"hasNextPage": False, "endCursor": None},
+        "nodes": [{"id": "PRRT_overflow", "isResolved": False, "isOutdated": False,
+                   "comments": {"pageInfo": {"hasNextPage": True, "endCursor": "cc1"}, "nodes": [c1, c2]}}],
+    }}}}}
+    overflow_response = {"data": {"node": {"comments": {
+        "pageInfo": {"hasNextPage": False, "endCursor": None},
+        "nodes": [overflow_comment],
+    }}}}
+
+    call_count = 0
+
+    def runner(args: list[str]) -> GhResult:
+        nonlocal call_count
+        call_count += 1
+        if call_count == 1:
+            return GhResult(0, json.dumps(threads_response), "")
+        # second call is the per-thread comment overflow query
+        assert any("threadId=PRRT_overflow" in a for a in args)
+        assert any("cursor=cc1" in a for a in args)
+        return GhResult(0, json.dumps(overflow_response), "")
+
+    client = GhClient(runner=runner)
+
+    # Act
+    threads = client.review_threads("owner/repo", 3)
+
+    # Assert — overflow comment appended; exactly 2 queries made
+    assert call_count == 2
+    assert len(threads) == 1
+    comment_ids = [c["databaseId"] for c in threads[0]["comments"]["nodes"]]
+    assert comment_ids == [1, 2, 3]
 
 
 def test_resolve_thread_unwraps_thread_payload() -> None:

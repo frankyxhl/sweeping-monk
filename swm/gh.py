@@ -39,7 +39,8 @@ query($owner: String!, $repo: String!, $pr: Int!, $cursor: String) {
           isOutdated
           path
           line
-          comments(first: 30) {
+          comments(first: 100) {
+            pageInfo { hasNextPage endCursor }
             nodes {
               databaseId
               author { login }
@@ -48,6 +49,25 @@ query($owner: String!, $repo: String!, $pr: Int!, $cursor: String) {
               replyTo { databaseId }
             }
           }
+        }
+      }
+    }
+  }
+}
+"""
+
+THREAD_COMMENTS_QUERY = """
+query($threadId: ID!, $cursor: String) {
+  node(id: $threadId) {
+    ... on PullRequestReviewThread {
+      comments(first: 100, after: $cursor) {
+        pageInfo { hasNextPage endCursor }
+        nodes {
+          databaseId
+          author { login }
+          body
+          createdAt
+          replyTo { databaseId }
         }
       }
     }
@@ -311,6 +331,26 @@ class GhClient:
         except (KeyError, TypeError):
             return []
 
+    def _paginate_thread_comments(self, thread_id: str, cursor: str) -> list[dict]:
+        """Fetch overflow comment pages for a single review thread."""
+        extra: list[dict] = []
+        while cursor:
+            args = [
+                "api", "graphql",
+                "-f", f"query={THREAD_COMMENTS_QUERY}",
+                "-f", f"threadId={thread_id}",
+                "-f", f"cursor={cursor}",
+            ]
+            data = self._json(args) or {}
+            try:
+                conn = data["data"]["node"]["comments"]
+            except (KeyError, TypeError):
+                break
+            extra.extend(conn.get("nodes") or [])
+            pi = conn.get("pageInfo") or {}
+            cursor = pi.get("endCursor") if pi.get("hasNextPage") else None
+        return extra
+
     def review_threads(self, repo: str, pr: int) -> list[dict]:
         owner, name = repo.split("/", 1)
         nodes: list[dict] = []
@@ -337,6 +377,14 @@ class GhClient:
             cursor = page_info.get("endCursor")
             if not cursor:
                 break
+        # Paginate nested comments for any thread that exceeded 100 comments.
+        for thread in nodes:
+            comments_conn = thread.get("comments") or {}
+            comments_pi = comments_conn.get("pageInfo") or {}
+            if comments_pi.get("hasNextPage") and comments_pi.get("endCursor"):
+                extra = self._paginate_thread_comments(thread["id"], comments_pi["endCursor"])
+                existing = comments_conn.get("nodes") or []
+                thread["comments"] = {"nodes": existing + extra}
         return nodes
 
     def resolve_thread(self, thread_id: str) -> dict:
