@@ -662,3 +662,38 @@ def test_poll_continues_when_diff_fetch_fails(store: StateStore) -> None:
     assert snap.evidence is not None
     assert snap.evidence.llm_error is not None
     assert "diff fetch failed" in snap.evidence.llm_error
+
+
+def test_poll_skips_llm_when_diff_fetch_fails(store: StateStore) -> None:
+    """When pr_diff raises, the investigator must not be called — the model
+    would receive an empty diff and could return RESOLVED on thin evidence,
+    potentially closing threads and making the PR ready incorrectly."""
+    from swm.gh import GhCommandError
+    from swm.investigator import InvestigationDecision
+
+    investigate_calls: list[int] = []
+
+    class TrackingInvestigator:
+        def investigate(self, item):
+            investigate_calls.append(1)
+            return InvestigationDecision(verdict="RESOLVED", confidence=0.9, reason="ok", evidence=[])
+
+    class DiffFailingGh(FakeGhClient):
+        def pr_diff(self, repo, pr):
+            raise GhCommandError("simulated diff fetch failure")
+
+    gh = DiffFailingGh(
+        prs=[_pr_summary()],
+        review_threads={49: [_codex_thread(thread_id="PRRT_skip_llm", isOutdated=False)]},
+    )
+
+    outcomes = poll("owner/repo", store=store, gh_client=gh, investigator=TrackingInvestigator())
+
+    assert len(investigate_calls) == 0, (
+        "investigator.investigate() must not be called when diff fetch fails; "
+        f"was called {len(investigate_calls)} time(s)"
+    )
+    # Thread verdict must come from deterministic heuristic, not LLM.
+    snap = store.read_thread("owner/repo", 49, "PRRT_skip_llm")
+    assert snap is not None and snap.evidence is not None
+    assert snap.evidence.llm_evidence is None or snap.evidence.llm_evidence == []

@@ -392,6 +392,9 @@ def poll_pr(
             diff_error = f"diff fetch failed: {exc}"
     thread_models: list[Thread] = []
     snapshots: list[ThreadSnapshot] = []
+    # Disable LLM investigation when diff fetch failed — the model would receive
+    # an empty diff and could return RESOLVED on incomplete evidence.
+    active_investigator = None if diff_error else investigator
     for t in codex_threads:
         m, snap = _process_thread(
             t,
@@ -402,7 +405,7 @@ def poll_pr(
             branch_protected=branch_protected,
             diff_excerpt=diff_excerpt,
             diff_error=diff_error,
-            investigator=investigator,
+            investigator=active_investigator,
             now=now,
         )
         thread_models.append(m)
