@@ -454,6 +454,50 @@ def test_process_webhook_dedupes_concurrent_deliveries(
     assert "duplicate" in statuses, f"expected one duplicate, got {[r.status for r in results]}"
 
 
+def test_process_webhook_records_delivery_on_poll_failure(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """A poll() that raises must not propagate — the delivery must still be
+    appended so GitHub cannot redeliver and double-mutate partially-resolved threads."""
+    store = StateStore(tmp_path / "state")
+    cfg = _config(tmp_path)
+    monkeypatch.setenv("SWM_TEST_WEBHOOK_SECRET", "secret")
+
+    class FakeTokenProvider:
+        def token_for(self, **kwargs):
+            return "installation-token"
+
+    from tests.conftest import FakeGhClient
+
+    class NullGh(FakeGhClient):
+        def __init__(self, *, token=None, actor_login=None):
+            super().__init__(prs=[], active_login=actor_login or "iterwheel-clearance[bot]")
+            self.token = token
+
+    def fail_poll(*args, **kwargs):
+        raise RuntimeError("sync exploded mid-resolve")
+
+    monkeypatch.setattr("swm.webhook.GhClient", NullGh)
+    monkeypatch.setattr("swm.webhook.run_poll", fail_poll)
+
+    body = json.dumps({"repository": {"full_name": "owner/repo"}}).encode()
+    headers = _headers(body, delivery="poll-fail-1")
+
+    result = process_webhook(
+        headers=headers, body=body, config=cfg,
+        token_provider=FakeTokenProvider(), store=store,
+    )
+
+    assert result.status == "processed"
+    assert any(a.action == "poll-error" for a in result.actions), \
+        f"expected poll-error action, got: {[a.action for a in result.actions]}"
+
+    # Same delivery_id must be deduped on redelivery.
+    result2 = process_webhook(headers=headers, body=body, config=cfg, store=store)
+    assert result2.status == "duplicate", \
+        f"redelivery must be deduped, got: {result2.status}"
+
+
 def test_auto_approve_blocks_when_head_drifts_inside_lock(
     tmp_path: Path, monkeypatch
 ) -> None:

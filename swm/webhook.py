@@ -360,13 +360,21 @@ def process_webhook(
                 api_url=actor.api_url,
             )
             gh_client = GhClient(token=token, actor_login=actor.bot_login)
-            outcomes = run_poll(
-                watch.repo,
-                store=store,
-                gh_client=gh_client,
-                sync=watch.auto_resolve,
-                base=watch.base,
-            )
+            try:
+                outcomes = run_poll(
+                    watch.repo,
+                    store=store,
+                    gh_client=gh_client,
+                    sync=watch.auto_resolve,
+                    base=watch.base,
+                )
+            except Exception as exc:
+                # A sync failure mid-resolve would leave partial mutations
+                # unaudited if the delivery is not recorded. Capture the error
+                # and fall through to _append_delivery so GitHub does not
+                # redeliver and double-mutate already-resolved threads.
+                actions.append(WebhookAction(watch.repo, None, "poll-error", str(exc)))
+                continue
             if not outcomes:
                 actions.append(WebhookAction(watch.repo, None, "poll", "no open PRs"))
             for outcome in outcomes:
