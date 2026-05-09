@@ -322,3 +322,73 @@ def test_auto_approve_blocks_when_head_drifts_between_poll_and_view(
     assert any(a.action == "approve-blocked" and "drifted" in a.detail for a in actions), \
         f"expected approve-blocked with 'drifted', got: {[(a.action, a.detail) for a in actions]}"
     assert store.read_ledger("owner/repo", 77) == []
+
+
+def test_auto_approve_serializes_concurrent_calls_for_same_head(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """Two concurrent webhook deliveries for the same ready PR+head must submit
+    exactly one approval — the per-head lock must serialize them."""
+    import threading
+    import datetime as _dt
+    from swm.webhook import _auto_approve_ready_pr
+    from swm.state import StateStore
+    from tests.conftest import FakeGhClient
+
+    store = StateStore(tmp_path / "state")
+    head = "concurr00" + "0" * 31
+
+    record = PollRecord(
+        ts=_dt.datetime(2026, 5, 9, 13, 0, tzinfo=_dt.timezone.utc),
+        repo="owner/repo", pr=88, title="concurrent PR",
+        head_sha=head, status=Status.READY,
+        ci={"test": CIConclusion.SUCCESS}, merge_state="CLEAN",
+        codex_open=0, codex_resolved=0, threads=[], trigger="test",
+    )
+
+    # Pre-populate the store so check_verdict finds the poll record.
+    store.append_poll(record)
+
+    approve_calls: list[int] = []
+    # Barrier synchronizes both threads right before the per-head lock is
+    # acquired, guaranteeing the race condition is exercised.
+    barrier = threading.Barrier(2)
+
+    class SyncGh(FakeGhClient):
+        def __init__(self, **kwargs):
+            super().__init__(
+                prs=[{"number": 88, "headRefOid": head, "author": {"login": "alice"}}],
+                active_login="iterwheel-clearance[bot]",
+            )
+
+        def view_pr(self, repo, pr, fields):
+            # Only barrier on the initial head-read call (before the lock).
+            # check_identity's view_pr(["author"]) call is inside the lock and
+            # must not hit the barrier to avoid deadlock.
+            if set(fields) == {"headRefOid", "author"}:
+                barrier.wait()
+            return {"headRefOid": head, "author": {"login": "alice"}}
+
+        def submit_review_approve(self, repo, pr, body, *, commit_id):
+            approve_calls.append(1)
+            return {"stdout": ""}
+
+    results: list = [None, None]
+
+    def worker(idx: int) -> None:
+        results[idx] = _auto_approve_ready_pr(
+            store=store, gh_client=SyncGh(), record=record, actor_label="test",
+        )
+
+    t1 = threading.Thread(target=worker, args=(0,))
+    t2 = threading.Thread(target=worker, args=(1,))
+    t1.start()
+    t2.start()
+    t1.join(timeout=5)
+    t2.join(timeout=5)
+
+    assert len(approve_calls) == 1, \
+        f"submit_review_approve must be called exactly once, got {len(approve_calls)}"
+    actions = [r.action for r in results if r is not None]
+    assert "approved" in actions
+    assert "skip-approve" in actions

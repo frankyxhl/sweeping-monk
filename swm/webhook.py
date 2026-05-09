@@ -5,6 +5,7 @@ import hashlib
 import hmac
 import json
 import os
+import threading
 import tomllib
 from dataclasses import dataclass, field
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -28,6 +29,20 @@ RELEVANT_EVENTS = {
     "status",
     "issue_comment",
 }
+
+# Per-(repo, pr, head_sha) locks prevent concurrent webhook deliveries for the
+# same ready PR from both passing _already_approved_this_head() and submitting
+# duplicate approvals under ThreadingHTTPServer.
+_APPROVE_LOCKS: dict[str, threading.Lock] = {}
+_APPROVE_LOCKS_MUTEX = threading.Lock()
+
+
+def _approval_lock(repo: str, pr: int, head_sha: str) -> threading.Lock:
+    key = f"{repo}/{pr}/{head_sha}"
+    with _APPROVE_LOCKS_MUTEX:
+        if key not in _APPROVE_LOCKS:
+            _APPROVE_LOCKS[key] = threading.Lock()
+        return _APPROVE_LOCKS[key]
 
 
 @dataclass(frozen=True)
@@ -222,41 +237,46 @@ def _auto_approve_ready_pr(
                 record.repo, record.pr, "approve-blocked",
                 f"head drifted since poll ({record.head_sha[:8]} → {current_head[:8]})",
             )
-        if _already_approved_this_head(
-            store, repo=record.repo, pr=record.pr, head_sha=current_head,
-            actor=gh_client.auth_active_login(),
-        ):
-            return WebhookAction(record.repo, record.pr, "skip-approve", "already approved this head")
-
-        identity = guarded.check_identity(gh_client, record.repo, record.pr)
-        verdict = guarded.check_verdict(store, record.repo, record.pr, current_head)
-        blockers: list[str] = []
-        if identity.blocker:
-            blockers.append(identity.blocker)
-        ok, why = verdict.supports_approve()
-        if not ok and why:
-            blockers.append(why)
-        if blockers:
-            return WebhookAction(record.repo, record.pr, "approve-blocked", "; ".join(blockers))
-
-        reason = f"clearance-auto-approve: swm ready @ {current_head[:8]}"
-        body = guarded.render_approve_body(record, reason, actor_label=actor_label)
-        review_result = gh_client.submit_review_approve(
-            record.repo, record.pr, body, commit_id=current_head,
-        )
     except GhCommandError as exc:
         return WebhookAction(record.repo, record.pr, "approve-error", str(exc))
 
-    # Ledger immediately after the write succeeds — before nonessential verification,
-    # so a transient verify failure cannot leave an unaudited approval.
-    entry = guarded.build_approve_ledger_entry(
-        poll=record,
-        actor=identity.active_login,
-        reason=reason,
-        authorized_by="standing authorization (webhook auto_approve=true)",
-        review_result={"stdout": review_result.get("stdout", "")},
-    )
-    store.append_ledger(entry)
+    with _approval_lock(record.repo, record.pr, current_head):
+        try:
+            if _already_approved_this_head(
+                store, repo=record.repo, pr=record.pr, head_sha=current_head,
+                actor=gh_client.auth_active_login(),
+            ):
+                return WebhookAction(record.repo, record.pr, "skip-approve", "already approved this head")
+
+            identity = guarded.check_identity(gh_client, record.repo, record.pr)
+            verdict = guarded.check_verdict(store, record.repo, record.pr, current_head)
+            blockers: list[str] = []
+            if identity.blocker:
+                blockers.append(identity.blocker)
+            ok, why = verdict.supports_approve()
+            if not ok and why:
+                blockers.append(why)
+            if blockers:
+                return WebhookAction(record.repo, record.pr, "approve-blocked", "; ".join(blockers))
+
+            reason = f"clearance-auto-approve: swm ready @ {current_head[:8]}"
+            body = guarded.render_approve_body(record, reason, actor_label=actor_label)
+            review_result = gh_client.submit_review_approve(
+                record.repo, record.pr, body, commit_id=current_head,
+            )
+        except GhCommandError as exc:
+            return WebhookAction(record.repo, record.pr, "approve-error", str(exc))
+
+        # Ledger immediately after the write succeeds — before nonessential verification,
+        # so a transient verify failure cannot leave an unaudited approval.
+        entry = guarded.build_approve_ledger_entry(
+            poll=record,
+            actor=identity.active_login,
+            reason=reason,
+            authorized_by="standing authorization (webhook auto_approve=true)",
+            review_result={"stdout": review_result.get("stdout", "")},
+        )
+        store.append_ledger(entry)
 
     try:
         verify = gh_client.view_pr(record.repo, record.pr, ["reviewDecision", "mergeStateStatus"])
