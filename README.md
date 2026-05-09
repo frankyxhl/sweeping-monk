@@ -15,6 +15,14 @@ Stage 1.5 capability: when a Codex thread is locally judged `RESOLVED`,
 keep the GitHub UI in sync. No comments, no reviews, no merges — the human
 stays in charge.
 
+When `swm poll` emits `notify:` (CHG-1112): exactly once per positive
+ready/approved transition — `first-ready` (first poll for a PR that lands
+READY), `pending-to-ready`, `blocked-to-ready`, or `ready-after-head-bump`
+(both polls READY at differing head SHAs). Repeated polls at the same
+`state_key` short-circuit (CHG-1107) and emit zero `notify:` lines, so a
+cron pipeline can `grep -q "^notify:"` to surface only true transitions.
+Each notification also lands in `state/notifications.jsonl` for audit.
+
 ## Quickstart
 
 ```bash

@@ -19,6 +19,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 
+import typer
+
 from . import classify, judge, severity
 from .gh import GhClient
 from .models import (
@@ -33,6 +35,7 @@ from .models import (
     Verdict,
     VerdictHistoryEntry,
 )
+from .notify import NotificationRecord, detect_positive_transition
 from .state import StateStore, now_utc
 
 # An empty statusCheckRollup is ambiguous: either GitHub Actions decided not to
@@ -383,6 +386,22 @@ def poll(
         store.append_poll(record)
         for snap in snapshots:
             store.write_thread(snap)
+
+        # CHG-1112: detect positive ready/approved transitions. Runs AFTER
+        # append_poll so a notification-write failure cannot drop the audit
+        # row, and AFTER the no_change check so identical state_key polls
+        # never re-notify (CHG-1107 short-circuit invariant).
+        if not no_change:
+            transition = detect_positive_transition(prior, record)
+            if transition is not None:
+                note = NotificationRecord.from_transition(prior, record, transition)
+                store.append_notification(note)
+                short_sha = record.head_sha[:7]
+                typer.echo(
+                    f"notify: {repo}#{record.pr} {transition} "
+                    f"@ {short_sha} -> {note.suggested_action}"
+                )
+
         outcomes.append(PollOutcome(
             record=record, snapshots=snapshots, sync_actions=actions,
             is_no_change=no_change,

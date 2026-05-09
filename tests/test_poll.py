@@ -470,3 +470,82 @@ def test_poll_outcome_is_changed_when_sync_actions_occur(store, monkeypatch, rea
     assert outcomes[0].is_no_change is False, (
         "P2: sync mutation must mark outcome as changed, not no-change"
     )
+
+
+# --- CHG-1112: notify-on-positive-transition implementer check -------------
+
+
+def test_swm_poll_emits_at_most_one_notify_line_per_invocation(
+    store: StateStore, monkeypatch,
+) -> None:
+    """CHG-1112 implementer check (mirrors CHG-1107 Test C style).
+
+    Mimics the cron-grep contract: `grep -c "^notify:"` must return
+    * exactly 1 on a transition fixture (pending → ready), and
+    * exactly 0 on a no-change fixture (re-poll at same state_key).
+
+    Distinct prefix from `no change:` so a downstream cron pipeline can
+    `grep -q "^notify:"` to surface only true positive transitions.
+    """
+    from typer.testing import CliRunner
+
+    from swm.cli import app
+
+    runner = CliRunner()
+    from swm.models import CIConclusion, PollRecord
+
+    # --- transition fixture: prior PENDING → new READY at new head ---------
+    prior = PollRecord(
+        ts=datetime(2026, 5, 9, 12, 0, 0, tzinfo=timezone.utc),
+        repo="owner/repo",
+        pr=49,
+        title="ci: skip docs",
+        head_sha="9" * 40,
+        status=Status.PENDING,
+        ci={"ci": CIConclusion.IN_PROGRESS},
+        merge_state="CLEAN",
+        codex_open=0,
+        codex_resolved=0,
+        threads=[],
+        trigger="seed",
+    )
+    store.append_poll(prior)
+
+    fake_transition = FakeGhClient(prs=[_pr_summary(
+        head="abc123",  # new head_sha
+        ci=[{"name": "ci", "conclusion": "SUCCESS"}],  # now green → READY
+    )])
+    monkeypatch.setattr("swm.cli.GhClient", lambda: fake_transition)
+
+    result_transition = runner.invoke(
+        app, ["poll", "owner/repo", "--state-dir", str(store.directory)],
+    )
+    assert result_transition.exit_code == 0, result_transition.stdout
+
+    notify_lines = [
+        line for line in result_transition.stdout.splitlines()
+        if line.startswith("notify:")
+    ]
+    assert len(notify_lines) == 1, (
+        f"CHG-1112: pending→ready transition must emit exactly one '^notify:' "
+        f"line. Got {len(notify_lines)}:\n{result_transition.stdout}"
+    )
+
+    # --- no-change fixture: same FakeGhClient, second invocation -----------
+    # State_key now matches the just-persisted READY record — CHG-1107
+    # short-circuit fires BEFORE the notify branch.
+    result_no_change = runner.invoke(
+        app, ["poll", "owner/repo", "--state-dir", str(store.directory)],
+    )
+    assert result_no_change.exit_code == 0, result_no_change.stdout
+
+    notify_lines_2 = [
+        line for line in result_no_change.stdout.splitlines()
+        if line.startswith("notify:")
+    ]
+    assert len(notify_lines_2) == 0, (
+        f"CHG-1112: no-change re-poll must emit zero '^notify:' lines "
+        f"(CHG-1107 short-circuit fires first). Got {len(notify_lines_2)}:\n"
+        f"{result_no_change.stdout}"
+    )
+    assert "no change:" in result_no_change.stdout
