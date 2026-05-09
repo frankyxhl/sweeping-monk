@@ -633,3 +633,32 @@ def test_poll_investigator_falls_back_on_subprocess_timeout(store: StateStore) -
     thread = record.threads[0]
     assert thread.llm_verdict is None
     assert thread.llm_reason is None
+
+def test_poll_continues_when_diff_fetch_fails(store: StateStore) -> None:
+    """A GhCommandError from pr_diff must not abort the poll; llm_error records the failure."""
+    from swm.gh import GhCommandError
+    from swm.investigator import InvestigationDecision
+
+    class AlwaysResolveInvestigator:
+        def investigate(self, item):
+            return InvestigationDecision(verdict="RESOLVED", confidence=0.9, reason="ok", evidence=[])
+
+    class DiffFailingGh(FakeGhClient):
+        def pr_diff(self, repo, pr):
+            raise GhCommandError("simulated diff fetch failure")
+
+    gh = DiffFailingGh(
+        prs=[_pr_summary()],
+        review_threads={49: [_codex_thread(thread_id="PRRT_diff_fail", isOutdated=False)]},
+    )
+
+    outcomes = poll("owner/repo", store=store, gh_client=gh, investigator=AlwaysResolveInvestigator())
+
+    record = outcomes[0].record
+    assert record is not None, "poll must not abort on diff fetch failure"
+    # Evidence must record the diff error so it is auditable.
+    snap = store.read_thread("owner/repo", 49, "PRRT_diff_fail")
+    assert snap is not None
+    assert snap.evidence is not None
+    assert snap.evidence.llm_error is not None
+    assert "diff fetch failed" in snap.evidence.llm_error

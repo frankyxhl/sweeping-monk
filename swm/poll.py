@@ -23,7 +23,7 @@ from datetime import datetime, timedelta, timezone
 import typer
 
 from . import classify, judge, severity
-from .gh import GhClient
+from .gh import GhClient, GhCommandError
 from .investigator import (
     InvestigationDecision,
     InvestigationError,
@@ -226,6 +226,7 @@ def _process_thread(
     head_sha: str,
     branch_protected: bool,
     diff_excerpt: str,
+    diff_error: str | None = None,
     investigator: ThreadInvestigator | None,
     now,
 ) -> tuple[Thread, ThreadSnapshot]:
@@ -316,7 +317,7 @@ def _process_thread(
             llm_confidence=llm_decision.confidence if llm_decision else None,
             llm_reason=llm_decision.reason if llm_decision else None,
             llm_evidence=llm_decision.evidence if llm_decision else None,
-            llm_error=llm_error,
+            llm_error=llm_error or diff_error,
             demotion_reason=sev_decision.reason,
         ),
         github_state=GitHubThreadState(
@@ -382,7 +383,13 @@ def poll_pr(
     head_sha = pr_summary["headRefOid"]
     raw_threads = gh_client.review_threads(repo, pr)
     codex_threads = [t for t in raw_threads if classify.is_codex_thread(t)]
-    diff_excerpt = gh_client.pr_diff(repo, pr) if investigator and codex_threads else ""
+    diff_excerpt = ""
+    diff_error: str | None = None
+    if investigator and codex_threads:
+        try:
+            diff_excerpt = gh_client.pr_diff(repo, pr)
+        except GhCommandError as exc:
+            diff_error = f"diff fetch failed: {exc}"
     thread_models: list[Thread] = []
     snapshots: list[ThreadSnapshot] = []
     for t in codex_threads:
@@ -394,6 +401,7 @@ def poll_pr(
             head_sha=head_sha,
             branch_protected=branch_protected,
             diff_excerpt=diff_excerpt,
+            diff_error=diff_error,
             investigator=investigator,
             now=now,
         )
