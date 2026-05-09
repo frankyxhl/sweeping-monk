@@ -28,10 +28,11 @@ query($owner: String!, $repo: String!, $pr: Int!) {
 """
 
 REVIEW_THREADS_QUERY = """
-query($owner: String!, $repo: String!, $pr: Int!) {
+query($owner: String!, $repo: String!, $pr: Int!, $cursor: String) {
   repository(owner: $owner, name: $repo) {
     pullRequest(number: $pr) {
-      reviewThreads(first: 50) {
+      reviewThreads(first: 50, after: $cursor) {
+        pageInfo { hasNextPage endCursor }
         nodes {
           id
           isResolved
@@ -312,18 +313,31 @@ class GhClient:
 
     def review_threads(self, repo: str, pr: int) -> list[dict]:
         owner, name = repo.split("/", 1)
-        args = [
-            "api", "graphql",
-            "-f", f"query={REVIEW_THREADS_QUERY}",
-            "-F", f"owner={owner}",
-            "-F", f"repo={name}",
-            "-F", f"pr={pr}",
-        ]
-        data = self._json(args) or {}
-        try:
-            return list(data["data"]["repository"]["pullRequest"]["reviewThreads"]["nodes"])
-        except (KeyError, TypeError):
-            return []
+        nodes: list[dict] = []
+        cursor: str | None = None
+        while True:
+            args = [
+                "api", "graphql",
+                "-f", f"query={REVIEW_THREADS_QUERY}",
+                "-F", f"owner={owner}",
+                "-F", f"repo={name}",
+                "-F", f"pr={pr}",
+            ]
+            if cursor:
+                args += ["-f", f"cursor={cursor}"]
+            data = self._json(args) or {}
+            try:
+                connection = data["data"]["repository"]["pullRequest"]["reviewThreads"]
+            except (KeyError, TypeError):
+                break
+            nodes.extend(connection.get("nodes") or [])
+            page_info = connection.get("pageInfo") or {}
+            if not page_info.get("hasNextPage"):
+                break
+            cursor = page_info.get("endCursor")
+            if not cursor:
+                break
+        return nodes
 
     def resolve_thread(self, thread_id: str) -> dict:
         """Stage 1.5 mutation. Caller is responsible for verifying local verdict=RESOLVED."""

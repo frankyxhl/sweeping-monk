@@ -135,6 +135,35 @@ def test_review_threads_handles_missing_pr_key() -> None:
     assert client.review_threads("owner/repo", 99) == []
 
 
+def test_review_threads_paginates_when_has_next_page() -> None:
+    # Arrange — page 1 signals hasNextPage; page 2 has endCursor=null/no-next
+    page1 = {"data": {"repository": {"pullRequest": {"reviewThreads": {
+        "pageInfo": {"hasNextPage": True, "endCursor": "cursor-abc"},
+        "nodes": [{"id": "T1", "isResolved": False, "isOutdated": False, "comments": {"nodes": []}}],
+    }}}}}
+    page2 = {"data": {"repository": {"pullRequest": {"reviewThreads": {
+        "pageInfo": {"hasNextPage": False, "endCursor": None},
+        "nodes": [{"id": "T2", "isResolved": True,  "isOutdated": False, "comments": {"nodes": []}}],
+    }}}}}
+    responses: list[dict] = [page1, page2]
+    calls: list[list[str]] = []
+
+    def runner(args: list[str]) -> GhResult:
+        calls.append(args)
+        return GhResult(returncode=0, stdout=json.dumps(responses[len(calls) - 1]), stderr="")
+
+    client = GhClient(runner=runner)
+
+    # Act
+    threads = client.review_threads("owner/repo", 7)
+
+    # Assert — both pages collected
+    assert [t["id"] for t in threads] == ["T1", "T2"]
+    assert len(calls) == 2
+    # second call must carry the cursor
+    assert any("cursor=cursor-abc" in a for a in calls[1])
+
+
 def test_resolve_thread_unwraps_thread_payload() -> None:
     # Arrange
     payload = {"data": {"resolveReviewThread": {"thread": {"id": "T1", "isResolved": True, "resolvedBy": {"login": "tester"}}}}}
