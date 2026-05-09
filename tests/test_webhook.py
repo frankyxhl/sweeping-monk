@@ -266,3 +266,59 @@ def test_auto_approve_ledgers_even_when_verify_view_pr_fails(
     ledger = store.read_ledger("owner/repo", 66)
     assert len(ledger) == 1, "ledger entry must survive a verify view_pr failure"
     assert ledger[0].actor == "iterwheel-clearance[bot]"
+
+
+def test_auto_approve_blocks_when_head_drifts_between_poll_and_view(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """If the PR head advances after run_poll() but before view_pr() in
+    _auto_approve_ready_pr, approval must be blocked — not submitted against
+    the stale record."""
+    import datetime as _dt
+    from swm.state import StateStore
+    from tests.conftest import FakeGhClient
+
+    store = StateStore(tmp_path / "state")
+    cfg = _config(tmp_path)
+    monkeypatch.setenv("SWM_TEST_WEBHOOK_SECRET", "secret")
+
+    poll_head = "pollhead0" + "0" * 31
+    live_head = "livehead0" + "0" * 31  # head advanced since poll
+
+    record = PollRecord(
+        ts=_dt.datetime(2026, 5, 9, 11, 0, tzinfo=_dt.timezone.utc),
+        repo="owner/repo", pr=77, title="drift PR",
+        head_sha=poll_head, status=Status.READY,
+        ci={"test": CIConclusion.SUCCESS}, merge_state="CLEAN",
+        codex_open=0, codex_resolved=0, threads=[], trigger="test",
+    )
+
+    class DriftGh(FakeGhClient):
+        def __init__(self, *, token=None, actor_login=None):
+            super().__init__(
+                prs=[{"number": 77, "headRefOid": live_head, "author": {"login": "someone"}}],
+                active_login=actor_login or "iterwheel-clearance[bot]",
+            )
+            self.token = token
+
+    def fake_run_poll(repo, *, store, gh_client, sync, base):
+        store.append_poll(record)
+        return [PollOutcome(record=record, snapshots=[], sync_actions=[], is_no_change=False)]
+
+    class FakeTokenProvider:
+        def token_for(self, **kwargs):
+            return "installation-token"
+
+    monkeypatch.setattr("swm.webhook.run_poll", fake_run_poll)
+    monkeypatch.setattr("swm.webhook.GhClient", DriftGh)
+
+    body = json.dumps({"repository": {"full_name": "owner/repo"}}).encode()
+    result = process_webhook(
+        headers=_headers(body, delivery="d-drift"), body=body, config=cfg,
+        token_provider=FakeTokenProvider(), store=store,
+    )
+
+    actions = result.actions
+    assert any(a.action == "approve-blocked" and "drifted" in a.detail for a in actions), \
+        f"expected approve-blocked with 'drifted', got: {[(a.action, a.detail) for a in actions]}"
+    assert store.read_ledger("owner/repo", 77) == []

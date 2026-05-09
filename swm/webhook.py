@@ -217,6 +217,11 @@ def _auto_approve_ready_pr(
         current_head = view.get("headRefOid", "")
         if not current_head:
             return WebhookAction(record.repo, record.pr, "approve-blocked", "could not read current head")
+        if current_head != record.head_sha:
+            return WebhookAction(
+                record.repo, record.pr, "approve-blocked",
+                f"head drifted since poll ({record.head_sha[:8]} → {current_head[:8]})",
+            )
         if _already_approved_this_head(
             store, repo=record.repo, pr=record.pr, head_sha=current_head,
             actor=gh_client.auth_active_login(),
