@@ -36,6 +36,12 @@ RELEVANT_EVENTS = {
 _APPROVE_LOCKS: dict[str, threading.Lock] = {}
 _APPROVE_LOCKS_MUTEX = threading.Lock()
 
+# Reserve delivery IDs atomically before processing starts so a duplicate
+# delivery that arrives while the first handler thread is still running
+# (and hasn't written to the JSONL file yet) is still deduplicated.
+_INFLIGHT_DELIVERIES: set[str] = set()
+_INFLIGHT_MUTEX = threading.Lock()
+
 
 def _approval_lock(repo: str, pr: int, head_sha: str) -> threading.Lock:
     key = f"{repo}/{pr}/{head_sha}"
@@ -259,6 +265,16 @@ def _auto_approve_ready_pr(
             if blockers:
                 return WebhookAction(record.repo, record.pr, "approve-blocked", "; ".join(blockers))
 
+            # Re-read the head inside the lock, right before submitting, to
+            # catch drift that occurred during identity/verdict checks above.
+            live_view = gh_client.view_pr(record.repo, record.pr, ["headRefOid"])
+            live_head = live_view.get("headRefOid", "")
+            if live_head != record.head_sha:
+                return WebhookAction(
+                    record.repo, record.pr, "approve-blocked",
+                    f"head drifted before approval ({record.head_sha[:8]} → {live_head[:8]})",
+                )
+
             reason = f"clearance-auto-approve: swm ready @ {current_head[:8]}"
             body = guarded.render_approve_body(record, reason, actor_label=actor_label)
             review_result = gh_client.submit_review_approve(
@@ -317,64 +333,71 @@ def process_webhook(
         return WebhookResult(delivery_id, event, None, "ignored-no-repo")
 
     store = store or StateStore(config.state_dir)
-    if _delivery_seen(store, delivery_id):
-        return WebhookResult(delivery_id, event, repo, "duplicate")
 
-    watches = config.watches_for_repo(repo)
-    if not watches:
-        result = WebhookResult(delivery_id, event, repo, "ignored-repo")
+    with _INFLIGHT_MUTEX:
+        if delivery_id in _INFLIGHT_DELIVERIES or _delivery_seen(store, delivery_id):
+            return WebhookResult(delivery_id, event, repo, "duplicate")
+        _INFLIGHT_DELIVERIES.add(delivery_id)
+
+    try:
+        watches = config.watches_for_repo(repo)
+        if not watches:
+            result = WebhookResult(delivery_id, event, repo, "ignored-repo")
+            _append_delivery(store, result)
+            return result
+
+        token_provider = token_provider or InstallationTokenProvider()
+        actions: list[WebhookAction] = []
+        for watch in watches:
+            if watch.auto_merge:
+                actions.append(WebhookAction(watch.repo, None, "config-error", "auto_merge is forbidden"))
+                continue
+            actor = config.actor(watch.actor)
+            token = token_provider.token_for(
+                app_id=actor.app_id,
+                installation_id=actor.installation_id,
+                private_key_path=actor.private_key_path,
+                api_url=actor.api_url,
+            )
+            gh_client = GhClient(token=token, actor_login=actor.bot_login)
+            outcomes = run_poll(
+                watch.repo,
+                store=store,
+                gh_client=gh_client,
+                sync=watch.auto_resolve,
+                base=watch.base,
+            )
+            if not outcomes:
+                actions.append(WebhookAction(watch.repo, None, "poll", "no open PRs"))
+            for outcome in outcomes:
+                if watch.auto_approve:
+                    actions.append(_auto_approve_ready_pr(
+                        store=store,
+                        gh_client=gh_client,
+                        record=outcome.record,
+                        actor_label="Iterwheel Clearance automation",
+                    ))
+                elif outcome.sync_actions:
+                    actions.append(WebhookAction(
+                        outcome.record.repo,
+                        outcome.record.pr,
+                        "resolved",
+                        f"{len(outcome.sync_actions)} thread(s)",
+                    ))
+                else:
+                    actions.append(WebhookAction(
+                        outcome.record.repo,
+                        outcome.record.pr,
+                        "polled",
+                        f"status={outcome.record.status.value}",
+                    ))
+
+        result = WebhookResult(delivery_id, event, repo, "processed", actions)
         _append_delivery(store, result)
         return result
-
-    token_provider = token_provider or InstallationTokenProvider()
-    actions: list[WebhookAction] = []
-    for watch in watches:
-        if watch.auto_merge:
-            actions.append(WebhookAction(watch.repo, None, "config-error", "auto_merge is forbidden"))
-            continue
-        actor = config.actor(watch.actor)
-        token = token_provider.token_for(
-            app_id=actor.app_id,
-            installation_id=actor.installation_id,
-            private_key_path=actor.private_key_path,
-            api_url=actor.api_url,
-        )
-        gh_client = GhClient(token=token, actor_login=actor.bot_login)
-        outcomes = run_poll(
-            watch.repo,
-            store=store,
-            gh_client=gh_client,
-            sync=watch.auto_resolve,
-            base=watch.base,
-        )
-        if not outcomes:
-            actions.append(WebhookAction(watch.repo, None, "poll", "no open PRs"))
-        for outcome in outcomes:
-            if watch.auto_approve:
-                actions.append(_auto_approve_ready_pr(
-                    store=store,
-                    gh_client=gh_client,
-                    record=outcome.record,
-                    actor_label="Iterwheel Clearance automation",
-                ))
-            elif outcome.sync_actions:
-                actions.append(WebhookAction(
-                    outcome.record.repo,
-                    outcome.record.pr,
-                    "resolved",
-                    f"{len(outcome.sync_actions)} thread(s)",
-                ))
-            else:
-                actions.append(WebhookAction(
-                    outcome.record.repo,
-                    outcome.record.pr,
-                    "polled",
-                    f"status={outcome.record.status.value}",
-                ))
-
-    result = WebhookResult(delivery_id, event, repo, "processed", actions)
-    _append_delivery(store, result)
-    return result
+    finally:
+        with _INFLIGHT_MUTEX:
+            _INFLIGHT_DELIVERIES.discard(delivery_id)
 
 
 def serve(config: WebhookConfig) -> None:

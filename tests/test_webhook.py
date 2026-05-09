@@ -394,6 +394,118 @@ def test_auto_approve_serializes_concurrent_calls_for_same_head(
     assert "skip-approve" in actions
 
 
+def test_process_webhook_dedupes_concurrent_deliveries(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """A duplicate delivery that arrives while the first is still processing
+    must be blocked by the in-flight set, not only by the JSONL file check."""
+    import threading
+    from tests.conftest import FakeGhClient
+
+    store = StateStore(tmp_path / "state")
+    cfg = _config(tmp_path)
+    monkeypatch.setenv("SWM_TEST_WEBHOOK_SECRET", "secret")
+
+    body = json.dumps({"repository": {"full_name": "owner/repo"}}).encode()
+    headers = _headers(body, delivery="concurrent-dup-1")
+
+    processing_started = threading.Event()
+    first_can_finish = threading.Event()
+
+    def fake_run_poll(repo, *, store, gh_client, sync, base):
+        processing_started.set()
+        first_can_finish.wait()
+        return []
+
+    class FakeTokenProvider:
+        def token_for(self, **kwargs):
+            return "installation-token"
+
+    class NullGh(FakeGhClient):
+        def __init__(self, *, token=None, actor_login=None):
+            super().__init__(prs=[], active_login=actor_login or "iterwheel-clearance[bot]")
+            self.token = token
+
+    monkeypatch.setattr("swm.webhook.run_poll", fake_run_poll)
+    monkeypatch.setattr("swm.webhook.GhClient", NullGh)
+
+    results: list = [None, None]
+
+    def first_request():
+        results[0] = process_webhook(
+            headers=headers, body=body, config=cfg,
+            token_provider=FakeTokenProvider(), store=store,
+        )
+
+    def second_request():
+        processing_started.wait()
+        results[1] = process_webhook(headers=headers, body=body, config=cfg, store=store)
+
+    t1 = threading.Thread(target=first_request)
+    t2 = threading.Thread(target=second_request)
+    t1.start()
+    t2.start()
+    t2.join(timeout=5)
+    first_can_finish.set()
+    t1.join(timeout=5)
+
+    statuses = {r.status for r in results if r is not None}
+    assert "processed" in statuses, f"expected one processed, got {[r.status for r in results]}"
+    assert "duplicate" in statuses, f"expected one duplicate, got {[r.status for r in results]}"
+
+
+def test_auto_approve_blocks_when_head_drifts_inside_lock(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """Head drift that occurs INSIDE the approval lock (after identity/verdict
+    checks) must be caught by the second view_pr call and block the approval."""
+    import datetime as _dt
+    from swm.webhook import _auto_approve_ready_pr
+    from swm.state import StateStore
+    from tests.conftest import FakeGhClient
+    from swm.models import CIConclusion, PollRecord, Status
+
+    store = StateStore(tmp_path / "state")
+    poll_head = "pollhead1" + "0" * 31
+    new_head = "newhead11" + "0" * 31
+
+    record = PollRecord(
+        ts=_dt.datetime(2026, 5, 10, 9, 0, tzinfo=_dt.timezone.utc),
+        repo="owner/repo", pr=99, title="late-drift PR",
+        head_sha=poll_head, status=Status.READY,
+        ci={"test": CIConclusion.SUCCESS}, merge_state="CLEAN",
+        codex_open=0, codex_resolved=0, threads=[], trigger="test",
+    )
+    store.append_poll(record)
+
+    approve_calls: list[int] = []
+
+    class LateDriftGh(FakeGhClient):
+        def __init__(self, **kwargs):
+            super().__init__(
+                prs=[{"number": 99, "headRefOid": poll_head, "author": {"login": "alice"}}],
+                active_login="iterwheel-clearance[bot]",
+            )
+
+        def view_pr(self, repo, pr, fields):
+            if set(fields) == {"headRefOid"}:
+                return {"headRefOid": new_head}
+            return {"headRefOid": poll_head, "author": {"login": "alice"}}
+
+        def submit_review_approve(self, repo, pr, body, *, commit_id):
+            approve_calls.append(1)
+            return {"stdout": ""}
+
+    result = _auto_approve_ready_pr(
+        store=store, gh_client=LateDriftGh(), record=record, actor_label="test",
+    )
+
+    assert result.action == "approve-blocked", f"unexpected action: {result.action}"
+    assert "drifted" in result.detail, f"unexpected detail: {result.detail}"
+    assert len(approve_calls) == 0, "submit_review_approve must not be called when head drifts inside lock"
+    assert store.read_ledger("owner/repo", 99) == []
+
+
 def test_serve_reuses_token_provider_across_requests(tmp_path: Path, monkeypatch) -> None:
     """serve() must create one InstallationTokenProvider shared across all requests,
     so the in-memory token cache is preserved across deliveries."""
