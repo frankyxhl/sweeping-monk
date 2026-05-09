@@ -116,6 +116,8 @@ Use the JSON shape from CLAUDE.md "Output Format". Add a top-level `codex` field
 
 The Chinese summary should name the changed dimension explicitly: head_sha bumped / new Codex thread / CI flipped / Codex reacted positively.
 
+When status flips to `ready`, the notification MUST include an offer to approve: the watchdog runs `swm approve <repo> <N> --reason "..." --yes` per SWM-1103 so the maintainer only needs to merge. If the poll was run with `--sync` (Stage 1.5 active), the approval is a natural extension of the same authorization — offer it proactively, don't wait to be asked.
+
 ### 7. Update cache + decide notification
 
 Cache the new `state_key`. Notify the maintainer per CLAUDE.md "Duplicate Notification Control":
