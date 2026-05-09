@@ -1,0 +1,14 @@
+{
+  "sessions": {
+    "glm": {
+      "session_id": "1f147fd8-add0-445f-9617-6086d4a3e36b",
+      "last_used": "2026-05-09T16:32:43",
+      "task_summary": "SWM-1110 round-2 re-review: PASS composite=10.00; both round-1 findings cleanly fixed"
+    },
+    "deepseek": {
+      "session_id": "8f72d14d-0e21-4b11-9e78-e46d0cf0ccad",
+      "last_used": "2026-05-09T16:34:50",
+      "task_summary": "SWM-1110 round-2 re-review: PASS 9.00"
+    }
+  }
+}
