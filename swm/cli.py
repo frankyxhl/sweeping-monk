@@ -27,8 +27,8 @@ from .close_reason import (
 from .gh import GhClient, GhCommandError
 from .github_app import InstallationTokenProvider
 from .investigator import build_investigator_from_env
-from .models import Thread, ThreadSnapshot, Verdict
-from .poll import _maybe_sync, poll as run_poll, poll_pr
+from .models import GitHubThreadState, Stage15Action, Thread, ThreadSnapshot, Verdict
+from .poll import poll as run_poll, poll_pr
 from .state import StateStore, default_store, now_utc
 from .webhook import load_config, serve as serve_webhook
 
@@ -347,6 +347,21 @@ def close_items_cmd(
             "re-run close-items to poll the new head"
         )
 
+    try:
+        record, snapshots = poll_pr(
+            pr_summary,
+            repo=repo,
+            gh_client=gh_client,
+            branch_protected=branch_protection is not None,
+            investigator=build_investigator_from_env(),
+            now=now_utc(),
+        )
+    except GhCommandError as exc:
+        _abort(str(exc))
+    snapshots_by_id = {s.thread_id: s for s in snapshots}
+    open_threads = _open_review_threads(record.threads, snapshots)
+    closable = _closable_threads(record.threads, snapshots)
+
     for thread in open_threads:
         snapshot = snapshots_by_id.get(thread.id)
         if require_flash and thread.verdict is Verdict.RESOLVED and not has_flash_close_reason(thread, snapshot):
@@ -379,7 +394,22 @@ def close_items_cmd(
                 reply_results[thread.id] = gh_client.reply_to_review_comment(
                     repo, pr, thread.comment_id, body,
                 )
-        actions = _maybe_sync(record, snapshots, gh_client=gh_client)
+            if (snapshot and snapshot.github_state
+                    and thread.verdict is Verdict.RESOLVED
+                    and not snapshot.github_state.isResolved):
+                resolve_result = gh_client.resolve_thread(thread.id)
+                actions.append(Stage15Action(
+                    mutation="resolveReviewThread",
+                    threadId=thread.id,
+                    result=resolve_result or {},
+                ))
+                snapshot.github_state = GitHubThreadState(
+                    isResolved=True,
+                    isOutdated=snapshot.github_state.isOutdated,
+                    synced_via="Stage 1.5 resolveReviewThread",
+                    synced_at=record.ts,
+                )
+                thread.github_isResolved = True
     except GhCommandError as exc:
         record = record.model_copy(update={
             "stage15_actions": actions,

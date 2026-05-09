@@ -436,6 +436,81 @@ def test_close_items_require_flash_preflights_all_threads_before_any_mutation(st
     assert write_calls == [], "no mutations must fire before preflight completes"
 
 
+def test_close_items_captures_partial_actions_when_second_resolve_fails(store: StateStore, monkeypatch) -> None:
+    """actions list must contain the first resolve even when the second resolve raises —
+    so the audit comment says 'Closed this run: 1', not '0'."""
+    from tests.conftest import FakeGhClient
+    from swm.gh import GhCommandError
+    from swm.investigator import InvestigationDecision
+
+    class FakeInvestigator:
+        def investigate(self, item):
+            return InvestigationDecision(verdict="RESOLVED", confidence=0.9, reason="ok", evidence=[])
+
+    resolve_call_count = 0
+
+    class PartialResolveGh(FakeGhClient):
+        def resolve_thread(self, thread_id):
+            nonlocal resolve_call_count
+            resolve_call_count += 1
+            self._record("resolve_thread", thread_id)
+            if resolve_call_count >= 2:
+                raise GhCommandError("simulated second resolve failure")
+            return {"resolvedBy": {"login": "iterwheel-clearance[bot]"}}
+
+    threads = [
+        _codex_review_thread("PRRT_A"),
+        _codex_review_thread("PRRT_B"),
+    ]
+    fake = PartialResolveGh(prs=[_open_pr(49)], review_threads={49: threads})
+    monkeypatch.setattr("swm.cli.GhClient", lambda: fake)
+    monkeypatch.setattr("swm.cli.build_investigator_from_env", lambda: FakeInvestigator())
+
+    result = runner.invoke(app, [
+        "close-items", "owner/repo", "49", "--yes",
+        "--state-dir", str(store.directory),
+    ])
+
+    assert result.exit_code == 1
+    run_comment_calls = [c for c in fake.calls if c[0] == "create_issue_comment"]
+    assert run_comment_calls, "error audit comment must be posted"
+    audit_body = run_comment_calls[0][2]["body"]
+    assert "Closed this run: `1`" in audit_body, \
+        f"expected 'Closed this run: 1' in audit comment, got: {audit_body!r}"
+
+
+def test_close_items_re_polls_after_confirmation_to_get_fresh_verdicts(store: StateStore, monkeypatch) -> None:
+    """After confirmation, close-items must re-poll so thread state that changed
+    during the confirmation prompt is not written back with a stale verdict."""
+    from tests.conftest import FakeGhClient
+    from swm.investigator import InvestigationDecision
+
+    poll_count = 0
+
+    class CountingGh(FakeGhClient):
+        def review_threads(self, repo, pr):
+            nonlocal poll_count
+            poll_count += 1
+            return super().review_threads(repo, pr)
+
+    fake = CountingGh(
+        prs=[_open_pr(49)],
+        review_threads={49: [_codex_review_thread("PRRT_A")]},
+    )
+    monkeypatch.setattr("swm.cli.GhClient", lambda: fake)
+    monkeypatch.setattr("swm.cli.build_investigator_from_env", lambda: None)
+
+    runner.invoke(app, [
+        "close-items", "owner/repo", "49", "--yes",
+        "--state-dir", str(store.directory),
+    ])
+
+    assert poll_count >= 2, (
+        "close-items must re-fetch review threads after confirmation "
+        f"(review_threads called {poll_count} time(s), expected ≥2)"
+    )
+
+
 # --- SWM-1104 guarded subcommand tests --------------------------------------
 
 
