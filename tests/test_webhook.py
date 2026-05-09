@@ -392,3 +392,55 @@ def test_auto_approve_serializes_concurrent_calls_for_same_head(
     actions = [r.action for r in results if r is not None]
     assert "approved" in actions
     assert "skip-approve" in actions
+
+
+def test_serve_reuses_token_provider_across_requests(tmp_path: Path, monkeypatch) -> None:
+    """serve() must create one InstallationTokenProvider shared across all requests,
+    so the in-memory token cache is preserved across deliveries."""
+    import io
+    from swm.webhook import serve, WebhookResult
+
+    monkeypatch.setenv("SWM_TEST_WEBHOOK_SECRET", "secret")
+
+    process_providers: list = []
+
+    def fake_process_webhook(*, headers, body, config, token_provider=None, store=None):
+        process_providers.append(token_provider)
+        return WebhookResult("d1", "pull_request", None, "ignored-repo")
+
+    monkeypatch.setattr("swm.webhook.process_webhook", fake_process_webhook)
+
+    # Capture the Handler class without actually binding a socket.
+    captured: list = []
+
+    class FakeHTTPServer:
+        def __init__(self, addr, handler_cls):
+            captured.append(handler_cls)
+        def serve_forever(self):
+            pass
+
+    monkeypatch.setattr("swm.webhook.ThreadingHTTPServer", FakeHTTPServer)
+    serve(_config(tmp_path))
+
+    handler_cls = captured[0]
+
+    # Minimal stub that satisfies do_POST's attribute accesses without
+    # going through BaseHTTPRequestHandler.__init__ (which needs a real socket).
+    class FakeHandlerInstance:
+        path = "/github/webhook"
+        headers = {"Content-Length": "2", "X-Hub-Signature-256": "sha256=x",
+                   "X-GitHub-Delivery": "d0", "X-GitHub-Event": "pull_request"}
+        rfile = io.BytesIO(b"{}")
+        wfile = io.BytesIO()
+        def send_response(self, *a): pass
+        def send_header(self, *a): pass
+        def end_headers(self): pass
+
+    stub = FakeHandlerInstance()
+    handler_cls.do_POST(stub)
+    stub.rfile = io.BytesIO(b"{}")
+    handler_cls.do_POST(stub)
+
+    assert len(process_providers) == 2, "process_webhook must be called for both requests"
+    assert process_providers[0] is process_providers[1], \
+        "both requests must receive the same InstallationTokenProvider instance"

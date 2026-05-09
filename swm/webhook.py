@@ -378,6 +378,8 @@ def process_webhook(
 
 
 def serve(config: WebhookConfig) -> None:
+    token_provider = InstallationTokenProvider()
+
     class Handler(BaseHTTPRequestHandler):
         def do_POST(self) -> None:  # noqa: N802 - stdlib hook name
             if self.path != config.server.path:
@@ -387,7 +389,10 @@ def serve(config: WebhookConfig) -> None:
             length = int(self.headers.get("Content-Length", "0"))
             body = self.rfile.read(length)
             try:
-                result = process_webhook(headers=self.headers, body=body, config=config)
+                result = process_webhook(
+                    headers=self.headers, body=body, config=config,
+                    token_provider=token_provider,
+                )
                 response = json.dumps({
                     "status": result.status,
                     "repo": result.repo,
