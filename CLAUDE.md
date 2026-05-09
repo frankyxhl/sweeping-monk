@@ -238,7 +238,7 @@ When a PR becomes ready, notify the maintainer with:
 - Reviewed head SHA.
 - CI summary.
 - Local review summary.
-- Suggested next action: manually inspect and merge if satisfied.
+- Suggested next action: offer `swm approve <repo> <N> --reason "..."` (per SWM-1103). The watchdog can approve; the maintainer only needs to merge after approval. Offer proactively — don't wait for the maintainer to discover the ready notification and ask. Approval still requires explicit maintainer confirmation (either a "yes/approve" response or running the command interactively without --yes). `--sync` alone does not authorize Stage-3 writes; SWM-1103 requires the maintainer to name the action.
 
 When a PR is blocked, notify the maintainer with:
 

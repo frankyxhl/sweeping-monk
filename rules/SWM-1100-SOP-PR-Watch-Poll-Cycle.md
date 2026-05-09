@@ -116,6 +116,8 @@ Use the JSON shape from CLAUDE.md "Output Format". Add a top-level `codex` field
 
 The Chinese summary should name the changed dimension explicitly: head_sha bumped / new Codex thread / CI flipped / Codex reacted positively.
 
+When status flips to `ready`, the notification MUST proactively offer to approve per SWM-1103 (e.g., "PR ready. Want me to approve? I'll run `swm approve <repo> <N> --reason ...` — then you just merge."). The offer must be explicit and the approval action must be confirmed by the maintainer per SWM-1103 §When to Use. `--sync` is a Stage 1.5 thread-sync flag — it does NOT authorize Stage-3 approve writes. The maintainer must name the approve action; do not auto-approve without being asked.
+
 ### 7. Update cache + decide notification
 
 Cache the new `state_key`. Notify the maintainer per CLAUDE.md "Duplicate Notification Control":
