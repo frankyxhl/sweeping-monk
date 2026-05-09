@@ -511,6 +511,48 @@ def test_close_items_re_polls_after_confirmation_to_get_fresh_verdicts(store: St
     )
 
 
+def test_close_items_aborts_when_thread_state_drifts_after_confirmation(store: StateStore, monkeypatch) -> None:
+    """If a thread's verdict changes between confirmation and re-poll (e.g. a new
+    author reply lands during the confirmation prompt), close-items must abort
+    rather than silently act on a different plan than the operator confirmed."""
+    from tests.conftest import FakeGhClient
+    from swm.investigator import InvestigationDecision
+
+    class FakeInvestigator:
+        def investigate(self, item):
+            return InvestigationDecision(verdict="RESOLVED", confidence=0.9, reason="ok", evidence=[])
+
+    poll_call_count = 0
+
+    class DriftingThreadsGh(FakeGhClient):
+        def review_threads(self, repo, pr):
+            nonlocal poll_call_count
+            poll_call_count += 1
+            if poll_call_count == 1:
+                # First poll (pre-confirmation): one RESOLVED thread shown in plan.
+                return [_codex_review_thread("PRRT_A", is_outdated=True)]
+            # Re-poll (post-confirmation): thread is now also resolved by a
+            # second thread arriving, changing the closable set.
+            return [
+                _codex_review_thread("PRRT_A", is_outdated=True),
+                _codex_review_thread("PRRT_B", is_outdated=True),
+            ]
+
+    fake = DriftingThreadsGh(prs=[_open_pr(49)], review_threads={49: []})
+    monkeypatch.setattr("swm.cli.GhClient", lambda: fake)
+    monkeypatch.setattr("swm.cli.build_investigator_from_env", lambda: FakeInvestigator())
+
+    result = runner.invoke(app, [
+        "close-items", "owner/repo", "49", "--yes",
+        "--state-dir", str(store.directory),
+    ])
+
+    assert result.exit_code == 1
+    assert "Thread state changed" in result.stdout or "re-run close-items" in result.stdout
+    write_calls = [c for c in fake.calls if c[0] in {"reply_to_review_comment", "resolve_thread", "set_review_comment_reaction"}]
+    assert write_calls == [], f"no writebacks expected after drift abort, got: {write_calls}"
+
+
 # --- SWM-1104 guarded subcommand tests --------------------------------------
 
 

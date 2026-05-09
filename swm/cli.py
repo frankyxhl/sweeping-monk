@@ -335,6 +335,10 @@ def close_items_cmd(
         f"close {len(closable)} resolved item(s), on "
         f"{repo}#{pr} @ {record.head_sha[:8]}"
     )
+    # Snapshot the confirmed plan before waiting for user input.
+    confirmed_closable = {(t.id, t.verdict) for t in closable}
+    confirmed_open_ids = {t.id for t in open_threads}
+
     if not _confirm("Apply?", yes=yes):
         console.print("[yellow]aborted[/yellow]")
         raise typer.Exit(code=1)
@@ -361,6 +365,15 @@ def close_items_cmd(
     snapshots_by_id = {s.thread_id: s for s in snapshots}
     open_threads = _open_review_threads(record.threads, snapshots)
     closable = _closable_threads(record.threads, snapshots)
+
+    if (
+        {(t.id, t.verdict) for t in closable} != confirmed_closable
+        or {t.id for t in open_threads} != confirmed_open_ids
+    ):
+        _abort(
+            "Thread state changed while waiting for confirmation — "
+            "re-run close-items to see the updated plan"
+        )
 
     for thread in open_threads:
         snapshot = snapshots_by_id.get(thread.id)
