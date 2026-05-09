@@ -72,6 +72,9 @@ class Thread(BaseModel):
     demotion_reason: str | None = None
     github_resolvedBy: str | None = None
     stage15_synced_at: datetime | None = None
+    llm_verdict: str | None = None
+    llm_confidence: float | None = None
+    llm_reason: str | None = None
 
 
 class PollRecord(BaseModel):
@@ -126,6 +129,11 @@ class Evidence(BaseModel):
     code_change_summary: str | None = None
     codex_followed_up: bool | None = None
     codex_reaction: str | None = None
+    llm_verdict: str | None = None
+    llm_confidence: float | None = None
+    llm_reason: str | None = None
+    llm_evidence: list[str] | None = None
+    llm_error: str | None = None
     demotion_reason: str | None = None
     synced_via: str | None = None
     synced_at: datetime | None = None
